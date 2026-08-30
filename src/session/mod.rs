@@ -19,7 +19,7 @@ use crate::capture::{
 };
 use crate::config::BundlePrefix;
 use crate::sink::{self, Recording, Sink};
-use crate::writer::{self, CHANNELS, Finished, Writer, WriterSettings};
+use crate::writer::{self, CHANNELS, Finished, Writer, WriterSettings, Written};
 
 const IDLE_TICK: Duration = Duration::from_millis(200);
 
@@ -237,9 +237,13 @@ fn finish_session(
     capture.stop();
     let Rebuilds { succeeded, failed } = capture.rebuilds();
     let Finished { error, verdict } = writer.finish();
-    if let Some(failure) = error {
-        error!("writing {} failed: {failure}", partial.display());
-    }
+    let written = match error {
+        Some(failure) => {
+            error!("writing {} failed: {failure}", partial.display());
+            Written::Failed
+        }
+        None => Written::Whole,
+    };
     match verdict {
         Verdict::AudioPresent => info!("{} opened with audio present", partial.display()),
         Verdict::Undecided => info!("{} was too short to judge for silence", partial.display()),
@@ -256,6 +260,7 @@ fn finish_session(
         device_changes: succeeded,
         failed_device_changes: failed,
         verdict,
+        written,
     };
     let Err(failure) = sink.accept(recording) else {
         info!("session ended after {succeeded} rebuilds and {failed} exhausted ones");
@@ -625,6 +630,7 @@ mod tests {
             device_changes,
             failed_device_changes,
             verdict,
+            written,
         } = &accepted[0];
         assert!(
             partial.starts_with(dir.path()),
@@ -642,6 +648,11 @@ mod tests {
         assert_eq!(*device_changes, 1);
         assert_eq!(*failed_device_changes, 0);
         assert_eq!(*verdict, Verdict::Undecided);
+        assert_eq!(
+            *written,
+            Written::Whole,
+            "a session whose writer never failed says so in the sidecar"
+        );
 
         assert_eq!(capture.starts, 1);
         assert_eq!(capture.stops, 1);

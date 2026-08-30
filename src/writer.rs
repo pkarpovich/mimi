@@ -21,7 +21,9 @@ use objc2_core_foundation::CFURL;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::capture::{Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict};
+use crate::capture::{
+    Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict, settled,
+};
 
 /// CHANNELS is how many channels a recording carries: the microphone left, everyone else right.
 pub const CHANNELS: u32 = 2;
@@ -81,6 +83,13 @@ impl Errors {
         }
         *slot = Some(error);
     }
+}
+
+/// Written is whether the writer carried the whole session into the file, or gave up part way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Whole,
+    Failed,
 }
 
 /// Finished is what the writer thread leaves behind: the failure it hit and its silence verdict.
@@ -157,6 +166,7 @@ fn run(
     };
 
     let mut silence = Silence::new(OPENING_WINDOW);
+    let mut session = Verdict::Undecided;
     let mut encoding = Encoding::new(consumer.frames_per_block());
     loop {
         let stop = match stopping.try_recv() {
@@ -170,16 +180,23 @@ fn run(
             warn!("the writer fell behind and lost {dropped} blocks");
         }
         for block in blocks {
-            let written = write_block(&file, block, &formats, &mut encoding, &mut silence);
+            let written = write_block(
+                &file,
+                block,
+                &formats,
+                &mut encoding,
+                &mut silence,
+                &mut session,
+            );
             let Err(error) = written else {
                 continue;
             };
             errors.set(error);
-            return silence.verdict();
+            return settled(session, silence.verdict());
         }
 
         match stop {
-            Stopping::Yes => return silence.verdict(),
+            Stopping::Yes => return settled(session, silence.verdict()),
             Stopping::No => thread::sleep(DRAIN_INTERVAL),
         }
     }
@@ -212,6 +229,7 @@ fn write_block(
     formats: &Formats,
     encoding: &mut Encoding,
     silence: &mut Silence,
+    session: &mut Verdict,
 ) -> Result<(), WriterError> {
     let Block {
         microphone,
@@ -229,6 +247,7 @@ fn write_block(
     } = encoding;
 
     if *written != Some(*generation) {
+        *session = settled(*session, silence.verdict());
         silence.reset();
         resampler.reset();
     }
@@ -840,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rebuild_restarts_the_silence_window_on_the_open_file() {
+    fn a_window_that_fired_before_a_rebuild_is_still_what_the_session_reports() {
         let file = TempFile::new();
         let formats = Formats::new();
         formats.publish(1, 24_000.0);
@@ -879,8 +898,53 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(
             verdict,
-            Verdict::AudioPresent,
-            "the window a rebuild opened must judge the new capture, not the silent one before it"
+            Verdict::Silent,
+            "an opening judged silent is what the sidecar reports, whatever a rebuild heard after it"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_turned_silent_is_judged_on_its_own_window() {
+        let file = TempFile::new();
+        let formats = Formats::new();
+        formats.publish(1, 24_000.0);
+        formats.publish(2, 24_000.0);
+
+        let (producer, consumer) = ring(64, 4096);
+        let audible = vec![0.25; 4096];
+        let zeros = vec![0.0; 4096];
+        producer.push(BlockRef {
+            microphone: &audible,
+            system: &audible,
+            frames: 4096,
+            host_time: 0,
+            generation: 1,
+        });
+        for round in 1..19 {
+            producer.push(BlockRef {
+                microphone: &zeros,
+                system: &zeros,
+                frames: 4096,
+                host_time: round,
+                generation: 2,
+            });
+        }
+
+        let writer = spawn(
+            WriterSettings {
+                path: file.path().to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(error, None);
+        assert_eq!(
+            verdict,
+            Verdict::Silent,
+            "the window a rebuild opened must judge the new capture, not the audible one before it"
         );
     }
 

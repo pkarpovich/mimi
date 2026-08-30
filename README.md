@@ -73,16 +73,19 @@ The sidecar:
   "channels": 2,
   "device_changes": 1,
   "failed_device_changes": 0,
-  "silent": false
+  "silent": false,
+  "write_failed": false
 }
 ```
 
 `device_changes` counts the rebuilds that succeeded, `failed_device_changes` the ones that exhausted
-their retries - a recording whose capture never came back says so. `silent` is the verdict of the
-silence check, which watches the opening seconds of the recording and restarts on every rebuild, so
-what it reports is the most recently judged opening - the recording's own, or the last rebuild's.
-The check exists because a capture that turns into digital silence is otherwise invisible: callbacks
-keep firing, counters stay healthy, and the file is empty.
+their retries - a recording whose capture never came back says so, once per outage rather than once
+per retry. `silent` is the verdict of the silence check, which watches the opening seconds of the
+recording and restarts on every rebuild; an opening that was judged silent stays reported for the
+rest of the session, whatever a later rebuild heard. The check exists because a capture that turns
+into digital silence is otherwise invisible: callbacks keep firing, counters stay healthy, and the
+file is empty. `write_failed` says the writer gave up before the session ended - the file holds
+everything up to that point and nothing after it.
 
 ## Configuration
 

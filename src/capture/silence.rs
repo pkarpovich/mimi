@@ -81,6 +81,21 @@ impl Silence {
     }
 }
 
+/// settled folds a closed window's verdict into the one a session reports; silence is sticky.
+pub fn settled(session: Verdict, window: Verdict) -> Verdict {
+    match (session, window) {
+        (Verdict::Silent, Verdict::Silent) => Verdict::Silent,
+        (Verdict::Silent, Verdict::AudioPresent) => Verdict::Silent,
+        (Verdict::Silent, Verdict::Undecided) => Verdict::Silent,
+        (Verdict::AudioPresent, Verdict::Silent) => Verdict::Silent,
+        (Verdict::AudioPresent, Verdict::AudioPresent) => Verdict::AudioPresent,
+        (Verdict::AudioPresent, Verdict::Undecided) => Verdict::AudioPresent,
+        (Verdict::Undecided, Verdict::Silent) => Verdict::Silent,
+        (Verdict::Undecided, Verdict::AudioPresent) => Verdict::AudioPresent,
+        (Verdict::Undecided, Verdict::Undecided) => Verdict::Undecided,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +160,44 @@ mod tests {
         let mut silence = Silence::new(WINDOW);
         silence.feed(&[], WINDOW);
         assert_eq!(silence.verdict(), Verdict::Silent);
+    }
+
+    #[test]
+    fn a_window_that_fired_is_what_the_session_keeps_reporting() {
+        assert_eq!(
+            settled(Verdict::Silent, Verdict::AudioPresent),
+            Verdict::Silent,
+            "a window that opened on silence is not unsaid by a later one that heard audio"
+        );
+        assert_eq!(
+            settled(Verdict::AudioPresent, Verdict::Silent),
+            Verdict::Silent
+        );
+        assert_eq!(
+            settled(Verdict::Silent, Verdict::Undecided),
+            Verdict::Silent
+        );
+        assert_eq!(
+            settled(Verdict::AudioPresent, Verdict::Undecided),
+            Verdict::AudioPresent,
+            "a rebuild too late to fill its window does not erase what was already judged"
+        );
+    }
+
+    #[test]
+    fn a_session_that_judged_nothing_stays_undecided() {
+        assert_eq!(
+            settled(Verdict::Undecided, Verdict::Undecided),
+            Verdict::Undecided
+        );
+        assert_eq!(
+            settled(Verdict::Undecided, Verdict::AudioPresent),
+            Verdict::AudioPresent
+        );
+        assert_eq!(
+            settled(Verdict::Undecided, Verdict::Silent),
+            Verdict::Silent
+        );
     }
 
     #[test]

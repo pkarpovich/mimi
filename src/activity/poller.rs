@@ -51,14 +51,10 @@ where
     let mut processes = Vec::new();
     let mut devices = source.devices();
     loop {
-        let snapshot = source.snapshot();
-        for event in diff(&processes, &snapshot) {
-            let Ok(()) = events.send(event) else {
-                return;
-            };
-        }
-        processes = snapshot;
-
+        // Devices are sampled before the processes are diffed because opening the microphone is
+        // what changes them: a meeting app taking the input and the rate that take forced become
+        // visible in the same pass, and a session started on the previous pass's devices would
+        // rebuild itself away immediately.
         let sampled = source.devices();
         if sampled != devices {
             devices = sampled.clone();
@@ -66,6 +62,14 @@ where
                 return;
             };
         }
+
+        let snapshot = source.snapshot();
+        for event in diff(&processes, &snapshot) {
+            let Ok(()) = events.send(event) else {
+                return;
+            };
+        }
+        processes = snapshot;
 
         let Ok(()) = events.send(ActivityEvent::Tick) else {
             return;
@@ -233,6 +237,28 @@ mod tests {
                 ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 24_000.0)),
                 ActivityEvent::Tick,
             ]
+        );
+    }
+
+    #[test]
+    fn a_take_that_changed_the_devices_is_reported_after_the_change_it_caused() {
+        let (stop, stopped) = mpsc::channel();
+        drop(stop);
+        let source = Fake::new(
+            vec![vec![process(1, 4242, InputState::Running)]],
+            vec![
+                devices("20-F4-D4-60-E4-29:input", 48_000.0),
+                devices("20-F4-D4-60-E4-29:input", 24_000.0),
+            ],
+        );
+        assert_eq!(
+            collect(&source, stopped),
+            vec![
+                ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 24_000.0)),
+                ActivityEvent::InputTaken(process(1, 4242, InputState::Running)),
+                ActivityEvent::Tick,
+            ],
+            "a session must start on the devices the take itself put in front of it"
         );
     }
 

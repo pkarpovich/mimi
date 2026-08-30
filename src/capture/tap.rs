@@ -174,7 +174,8 @@ impl Capture for Tap {
         let Some(built) = self.built.clone() else {
             return Err(CaptureError::NotStarted);
         };
-        match devices::rebuild_needed(self.io, &built, devices) {
+        let io = self.io;
+        match devices::rebuild_needed(io, &built, devices) {
             Rebuild::NotRequired => return Ok(()),
             Rebuild::Required => {}
         }
@@ -186,7 +187,13 @@ impl Capture for Tap {
             self.rebuilds.succeeded += 1;
             return Ok(());
         };
-        self.rebuilds.failed += 1;
+        // The run loop retries a rebuild that exhausted its attempts every RECOVERY seconds, and
+        // each retry enters with capture already down. The failure it is retrying was counted when
+        // the attempts first ran out; counting it again would report one device change as hundreds.
+        match io {
+            Io::Running => self.rebuilds.failed += 1,
+            Io::Stopped => {}
+        }
         Err(error)
     }
 

@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::activity::BundleId;
 use crate::capture::Verdict;
+use crate::writer::Written;
 
 const AUDIO_EXTENSION: &str = "aac";
 const PARTIAL_EXTENSION: &str = "partial";
@@ -25,6 +26,7 @@ pub struct Recording {
     pub device_changes: u32,
     pub failed_device_changes: u32,
     pub verdict: Verdict,
+    pub written: Written,
 }
 
 #[derive(Debug, Error)]
@@ -63,6 +65,7 @@ impl Sink for LocalFolder {
             device_changes: _,
             failed_device_changes: _,
             verdict: _,
+            written: _,
         } = recording;
 
         let Some(completed) = completed_path(&partial) else {
@@ -106,6 +109,7 @@ struct Sidecar {
     device_changes: u32,
     failed_device_changes: u32,
     silent: bool,
+    write_failed: bool,
 }
 
 fn sidecar(recording: &Recording) -> Sidecar {
@@ -119,11 +123,16 @@ fn sidecar(recording: &Recording) -> Sidecar {
         device_changes,
         failed_device_changes,
         verdict,
+        written,
     } = recording;
     let silent = match verdict {
         Verdict::Silent => true,
         Verdict::AudioPresent => false,
         Verdict::Undecided => false,
+    };
+    let write_failed = match written {
+        Written::Failed => true,
+        Written::Whole => false,
     };
     Sidecar {
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, false),
@@ -138,6 +147,7 @@ fn sidecar(recording: &Recording) -> Sidecar {
         device_changes: *device_changes,
         failed_device_changes: *failed_device_changes,
         silent,
+        write_failed,
     }
 }
 
@@ -243,6 +253,7 @@ mod tests {
             device_changes: 1,
             failed_device_changes: 0,
             verdict: Verdict::AudioPresent,
+            written: Written::Whole,
         }
     }
 
@@ -304,9 +315,10 @@ mod tests {
         assert_eq!(described["device_changes"], 1);
         assert_eq!(described["failed_device_changes"], 0);
         assert_eq!(described["silent"], false);
+        assert_eq!(described["write_failed"], false);
         assert_eq!(
             described.as_object().expect("an object").len(),
-            9,
+            10,
             "the sidecar carries no field the plan does not document"
         );
     }
@@ -318,6 +330,16 @@ mod tests {
         assert!(sidecar(&recording).silent);
         recording.verdict = Verdict::Undecided;
         assert!(!sidecar(&recording).silent);
+    }
+
+    #[test]
+    fn a_writer_that_gave_up_marks_the_sidecar() {
+        let mut recording = recording(PathBuf::from("/tmp/x.aac.partial"));
+        recording.written = Written::Failed;
+        assert!(
+            sidecar(&recording).write_failed,
+            "a file the writer abandoned part way must not look complete"
+        );
     }
 
     #[test]
