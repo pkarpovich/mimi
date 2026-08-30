@@ -51,6 +51,11 @@ measured, not assumed:
 - One buffer means no input device is in the composition: system audio only, no microphone.
 - A buffer with more channels than the track needs is mixed down by averaging.
 - Frame counts that disagree between buffers are truncated to the shorter one.
+- A track is identified by its **position** in the list, never by which entries happen to carry
+  samples. A buffer that arrives with no channels or no data leaves its own track empty; it does not
+  promote the other buffer into its place. Ranking the non-empty entries instead puts the microphone
+  on the system track whenever the tap delivers an empty buffer, and `writer::fold` then swaps the
+  channels for those blocks.
 
 Reading channels *within* a buffer as if they were the two tracks produces a file where the sources
 are concatenated rather than separated. That mistake was made once during the spike; there is a test
@@ -107,6 +112,15 @@ change rate without changing UID. It also takes an `Io`, because a rebuild that 
 attempts leaves the baseline pointing at devices no capture is running on any more: without that
 input, devices that returned to what the session started on would be judged unchanged and the
 recording would stay silent for the rest of the meeting.
+
+That `Io` input is only reachable if somebody asks again, and the poller emits `DevicesChanged` on a
+change, not on a state. So the run loop owns a `Recovery`: capture it wanted but does not have,
+retried every `RECOVERY` seconds regardless of which event woke the loop. It covers both directions
+the same way - a rebuild that exhausted its attempts, and a session start that failed while the
+meeting app keeps holding the microphone and therefore produces no second `InputTaken` to trigger
+another attempt. Recovery is throttled rather than run on every tick because a permanently failing
+rebuild sleeps 750 ms per round, and a permanently failing start would otherwise log five times a
+second.
 
 ## Format generations, and why the writer resamples
 

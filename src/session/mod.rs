@@ -14,12 +14,17 @@ use signal_hook::flag;
 use tracing::{error, info, warn};
 
 use crate::activity::{ActivityEvent, BundleId, Devices};
-use crate::capture::{self, Capture, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Rebuilds, Verdict};
+use crate::capture::{
+    self, Capture, CaptureError, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Rebuilds, Verdict,
+};
 use crate::config::BundlePrefix;
 use crate::sink::{self, Recording, Sink};
 use crate::writer::{self, CHANNELS, Finished, Writer, WriterSettings};
 
 const IDLE_TICK: Duration = Duration::from_millis(200);
+
+/// RECOVERY is how often the run loop retries capture it wanted but does not have.
+pub const RECOVERY: Duration = Duration::from_secs(2);
 
 pub use decide::{Decider, SessionCommand, SessionStart};
 
@@ -75,6 +80,12 @@ struct Output {
     bit_rate: u32,
 }
 
+enum Recovery {
+    None,
+    Start(SessionStart),
+    Rebuild,
+}
+
 /// run drives sessions until the events end or a shutdown is requested.
 pub fn run(
     settings: Settings,
@@ -99,6 +110,8 @@ pub fn run(
     let mut decider = Decider::new(prefixes, grace);
     let mut devices = devices;
     let mut session = None;
+    let mut recovery = Recovery::None;
+    let mut recover_at = Instant::now() + RECOVERY;
 
     while !shutdown.requested() {
         let event = match events.recv_timeout(IDLE_TICK) {
@@ -106,17 +119,21 @@ pub fn run(
             Err(RecvTimeoutError::Timeout) => ActivityEvent::Tick,
             Err(RecvTimeoutError::Disconnected) => break,
         };
+        let now = Instant::now();
 
-        for command in decider.observe(&event, Instant::now()) {
+        for command in decider.observe(&event, now) {
             match command {
                 SessionCommand::Start(start) => {
-                    session = start_session(capture, &devices, &output, start);
-                    match &session {
-                        Some(_) => {}
-                        None => decider.abandon(),
-                    }
+                    session = start_session(capture, &devices, &output, start.clone());
+                    recovery = match &session {
+                        Some(_) => Recovery::None,
+                        None => Recovery::Start(start),
+                    };
                 }
-                SessionCommand::Stop => finish_session(capture, sink, &output, session.take()),
+                SessionCommand::Stop => {
+                    recovery = Recovery::None;
+                    finish_session(capture, sink, &output, session.take());
+                }
             }
         }
 
@@ -127,9 +144,19 @@ pub fn run(
                 devices = sampled;
                 match &session {
                     None => {}
-                    Some(_) => devices_changed(capture, &devices),
+                    Some(_) => {
+                        recovery = match devices_changed(capture, &devices) {
+                            Ok(()) => Recovery::None,
+                            Err(_) => Recovery::Rebuild,
+                        };
+                    }
                 }
             }
+        }
+
+        if now >= recover_at {
+            recover_at = now + RECOVERY;
+            recover(capture, &devices, &output, &mut session, &mut recovery);
         }
     }
 
@@ -237,8 +264,33 @@ fn finish_session(
     error!("the recording was not completed: {failure}");
 }
 
+fn recover(
+    capture: &mut impl Capture,
+    devices: &Devices,
+    output: &Output,
+    session: &mut Option<Session>,
+    recovery: &mut Recovery,
+) {
+    match recovery {
+        Recovery::None => {}
+        Recovery::Start(start) => {
+            let Some(started) = start_session(capture, devices, output, start.clone()) else {
+                return;
+            };
+            *session = Some(started);
+            *recovery = Recovery::None;
+        }
+        Recovery::Rebuild => {
+            let Ok(()) = devices_changed(capture, devices) else {
+                return;
+            };
+            *recovery = Recovery::None;
+        }
+    }
+}
+
 /// devices_changed forwards a device change to capture, which rebuilds only if it has to.
-pub fn devices_changed(capture: &mut impl Capture, devices: &Devices) {
+pub fn devices_changed(capture: &mut impl Capture, devices: &Devices) -> Result<(), CaptureError> {
     let Devices {
         input,
         output,
@@ -246,9 +298,10 @@ pub fn devices_changed(capture: &mut impl Capture, devices: &Devices) {
     } = devices;
     let Err(failure) = capture.rebuild(devices) else {
         info!("the devices changed to input {input:?}, output {output:?}, {sample_rate:?} Hz");
-        return;
+        return Ok(());
     };
     error!("capture did not rebuild on the current devices: {failure}");
+    Err(failure)
 }
 
 #[cfg(test)]
@@ -299,8 +352,9 @@ mod tests {
         starts: usize,
         stops: usize,
         rebuilds: Rebuilds,
-        failure: Option<CaptureError>,
-        start_failure: Option<CaptureError>,
+        failure: Option<(CaptureError, usize)>,
+        start_failure: Option<(CaptureError, usize)>,
+        attempts: Arc<AtomicUsize>,
     }
 
     impl FakeCapture {
@@ -310,23 +364,51 @@ mod tests {
                 starts: 0,
                 stops: 0,
                 rebuilds: Rebuilds::default(),
-                failure,
+                failure: failure.map(|failure| (failure, usize::MAX)),
                 start_failure: None,
+                attempts: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn failing_to_start(failure: CaptureError) -> Self {
             let mut capture = Self::new(None);
-            capture.start_failure = Some(failure);
+            capture.start_failure = Some((failure, usize::MAX));
             capture
         }
+
+        fn failing_the_first_start(failure: CaptureError) -> Self {
+            let mut capture = Self::new(None);
+            capture.start_failure = Some((failure, 1));
+            capture
+        }
+
+        fn failing_the_first_rebuild(failure: CaptureError) -> Self {
+            let mut capture = Self::new(None);
+            capture.failure = Some((failure, 1));
+            capture
+        }
+
+        fn attempts(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.attempts)
+        }
+    }
+
+    fn owed(failure: &mut Option<(CaptureError, usize)>) -> Option<CaptureError> {
+        let Some((failure, remaining)) = failure else {
+            return None;
+        };
+        if *remaining == 0 {
+            return None;
+        }
+        *remaining -= 1;
+        Some(*failure)
     }
 
     impl Capture for FakeCapture {
         fn start(&mut self, _devices: &Devices, _producer: Producer) -> Result<(), CaptureError> {
             self.starts += 1;
             self.rebuilds = Rebuilds::default();
-            let Some(failure) = self.start_failure else {
+            let Some(failure) = owed(&mut self.start_failure) else {
                 return Ok(());
             };
             Err(failure)
@@ -338,7 +420,8 @@ mod tests {
 
         fn rebuild(&mut self, devices: &Devices) -> Result<(), CaptureError> {
             self.rebuilt.push(devices.clone());
-            let Some(failure) = self.failure else {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            let Some(failure) = owed(&mut self.failure) else {
                 self.rebuilds.succeeded += 1;
                 return Ok(());
             };
@@ -455,7 +538,10 @@ mod tests {
     #[test]
     fn a_device_change_reaches_capture_as_a_rebuild() {
         let mut capture = FakeCapture::new(None);
-        devices_changed(&mut capture, &devices("BuiltInMicrophoneDevice"));
+        assert_eq!(
+            devices_changed(&mut capture, &devices("BuiltInMicrophoneDevice")),
+            Ok(())
+        );
         assert_eq!(capture.rebuilt, vec![devices("BuiltInMicrophoneDevice")]);
         assert_eq!(capture.stops, 0, "a device change does not end the session");
     }
@@ -463,7 +549,10 @@ mod tests {
     #[test]
     fn a_rebuild_that_failed_leaves_the_session_recording() {
         let mut capture = FakeCapture::new(Some(CaptureError::NoOutputDevice));
-        devices_changed(&mut capture, &devices("20-F4-D4-60-E4-29:input"));
+        assert_eq!(
+            devices_changed(&mut capture, &devices("20-F4-D4-60-E4-29:input")),
+            Err(CaptureError::NoOutputDevice)
+        );
         assert_eq!(capture.rebuilt.len(), 1);
         assert_eq!(
             capture.stops, 0,
@@ -644,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn a_capture_that_does_not_start_records_nothing_and_is_attempted_again() {
+    fn a_capture_that_does_not_start_records_nothing() {
         let dir = TempDir::new();
         let mut capture = FakeCapture::failing_to_start(CaptureError::NoOutputDevice);
         let sink = FakeSink::default();
@@ -654,15 +743,6 @@ mod tests {
         events
             .send(ActivityEvent::InputTaken(process(InputState::Running)))
             .expect("send the take");
-        events
-            .send(ActivityEvent::InputTaken(AudioProcess {
-                object: 12,
-                bundle_id: Some(BundleId::new("company.thebrowser.browser.helper")),
-                pid: 4243,
-                input: InputState::Running,
-                output: OutputState::Idle,
-            }))
-            .expect("send the second take");
         drop(events);
 
         run(
@@ -674,15 +754,104 @@ mod tests {
             &shutdown,
         );
 
-        assert_eq!(
-            capture.starts, 2,
-            "the next holder of the microphone must be given another attempt"
-        );
+        assert_eq!(capture.starts, 1);
         assert_eq!(sink.accepted().len(), 0, "nothing was recorded");
         assert!(
             !recording_in_progress(&dir.path()),
             "a capture that never started leaves no file behind"
         );
+    }
+
+    #[test]
+    fn a_start_that_failed_is_retried_while_the_meeting_still_holds_the_microphone() {
+        let dir = TempDir::new();
+        let mut capture = FakeCapture::failing_the_first_start(CaptureError::NoOutputDevice);
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+
+        events
+            .send(ActivityEvent::InputTaken(process(InputState::Running)))
+            .expect("send the take");
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                run(
+                    settings(dir.path(), Duration::from_secs(3600)),
+                    devices("BuiltInMicrophoneDevice"),
+                    &mut capture,
+                    &sink,
+                    incoming,
+                    &shutdown,
+                );
+            });
+
+            let deadline = Instant::now() + RECOVERY * 5;
+            while !recording_in_progress(&dir.path()) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            shutdown.request();
+            drop(events);
+        });
+
+        assert_eq!(
+            capture.starts, 2,
+            "a meeting that keeps the microphone emits no second take, so the retry must come from the run loop"
+        );
+        assert_eq!(
+            sink.accepted().len(),
+            1,
+            "the session that started late is still handed to the sink"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_rebuild_is_retried_until_capture_comes_back() {
+        let dir = TempDir::new();
+        let mut capture = FakeCapture::failing_the_first_rebuild(CaptureError::NoOutputDevice);
+        let attempts = capture.attempts();
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+
+        events
+            .send(ActivityEvent::InputTaken(process(InputState::Running)))
+            .expect("send the take");
+        events
+            .send(ActivityEvent::DevicesChanged(devices(
+                "20-F4-D4-60-E4-29:input",
+            )))
+            .expect("send the device change");
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                run(
+                    settings(dir.path(), Duration::from_secs(3600)),
+                    devices("BuiltInMicrophoneDevice"),
+                    &mut capture,
+                    &sink,
+                    incoming,
+                    &shutdown,
+                );
+            });
+
+            let deadline = Instant::now() + RECOVERY * 5;
+            while attempts.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            shutdown.request();
+            drop(events);
+        });
+
+        assert_eq!(
+            capture.rebuilt.len(),
+            2,
+            "a rebuild that exhausted its attempts must be tried again without a second device change"
+        );
+        let accepted = sink.accepted();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].device_changes, 1);
+        assert_eq!(accepted[0].failed_device_changes, 1);
     }
 
     #[test]

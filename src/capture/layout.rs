@@ -48,37 +48,35 @@ pub fn interpret(buffers: &[Buffer<'_>], tracks: &mut Tracks) -> usize {
     microphone.clear();
     system.clear();
 
-    let mut present = 0;
-    let mut first = None;
-    let mut last = None;
-    for buffer in buffers {
-        let Buffer { channels, samples } = buffer;
-        if *channels == 0 || samples.is_empty() {
-            continue;
-        }
-        present += 1;
-        if first.is_none() {
-            first = Some(*buffer);
-        }
-        last = Some(*buffer);
-    }
-
-    let Some(system_source) = last else {
-        return 0;
+    let (microphone_source, system_source) = match buffers {
+        [] => (None, None),
+        [system] => (None, carrying(*system)),
+        [microphone, system, ..] => (carrying(*microphone), carrying(*system)),
     };
-    let microphone_source = if present > 1 { first } else { None };
 
-    let mut frames = frames_of(system_source);
-    if let Some(source) = microphone_source {
-        frames = frames.min(frames_of(source));
-    }
+    let frames = match (microphone_source, system_source) {
+        (None, None) => return 0,
+        (Some(microphone), None) => frames_of(microphone),
+        (None, Some(system)) => frames_of(system),
+        (Some(microphone), Some(system)) => frames_of(microphone).min(frames_of(system)),
+    };
     let frames = frames.min(*frames_per_block);
 
     if let Some(source) = microphone_source {
         mix_down(source, frames, microphone);
     }
-    mix_down(system_source, frames, system);
+    if let Some(source) = system_source {
+        mix_down(source, frames, system);
+    }
     frames
+}
+
+fn carrying(buffer: Buffer<'_>) -> Option<Buffer<'_>> {
+    let Buffer { channels, samples } = buffer;
+    if channels == 0 || samples.is_empty() {
+        return None;
+    }
+    Some(buffer)
 }
 
 fn frames_of(buffer: Buffer<'_>) -> usize {
@@ -218,6 +216,29 @@ mod tests {
             "a skipped buffer must not become an empty microphone track paired with the tap"
         );
         assert_eq!(tracks.system(), &[0.5, 0.0]);
+    }
+
+    #[test]
+    fn an_empty_tap_buffer_leaves_the_microphone_on_its_own_track() {
+        let mut tracks = Tracks::new(512);
+        let frames = interpret(
+            &[
+                Buffer {
+                    channels: 1,
+                    samples: &[0.1, 0.2, 0.3],
+                },
+                Buffer::NONE,
+            ],
+            &mut tracks,
+        );
+
+        assert_eq!(frames, 3);
+        assert_eq!(
+            tracks.microphone(),
+            &[0.1, 0.2, 0.3],
+            "buffer 0 is the microphone whatever the tap buffer carries"
+        );
+        assert!(tracks.system().is_empty());
     }
 
     #[test]
