@@ -3,12 +3,16 @@
 #[cfg(test)]
 mod plist;
 
+mod activity;
 mod config;
+mod macos;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use argh::FromArgs;
+
+use crate::activity::AudioProcess;
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -88,7 +92,22 @@ fn home_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home))
 }
 
-fn run() {}
+fn run() {
+    for process in activity::audio_processes() {
+        let AudioProcess {
+            object,
+            bundle_id,
+            pid,
+            input,
+            output,
+        } = process;
+        let bundle_id = match bundle_id {
+            Some(bundle_id) => bundle_id.as_str().to_owned(),
+            None => String::from("<unknown>"),
+        };
+        println!("{object} pid={pid} {bundle_id} input={input:?} output={output:?}");
+    }
+}
 
 fn install() {}
 
