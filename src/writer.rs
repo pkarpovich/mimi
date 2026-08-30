@@ -154,9 +154,8 @@ fn run(
         }
     };
 
-    let mut applied = None;
     let mut silence = Silence::new(OPENING_WINDOW);
-    let mut stereo = Vec::with_capacity(2 * consumer.frames_per_block());
+    let mut encoding = Encoding::new(consumer.frames_per_block());
     loop {
         let stop = match stopping.try_recv() {
             Ok(()) => Stopping::Yes,
@@ -169,14 +168,7 @@ fn run(
             eprintln!("mimi: the writer fell behind and lost {dropped} blocks");
         }
         for block in blocks {
-            let written = write_block(
-                &file,
-                block,
-                &formats,
-                &mut applied,
-                &mut stereo,
-                &mut silence,
-            );
+            let written = write_block(&file, block, &formats, &mut encoding, &mut silence);
             let Err(error) = written else {
                 continue;
             };
@@ -191,19 +183,32 @@ fn run(
     }
 }
 
-/// Applied is the client format the open file currently carries.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Applied {
-    generation: u64,
-    sample_rate: f64,
+/// Encoding is what the writer thread carries from one block to the next.
+struct Encoding {
+    client: Option<f64>,
+    generation: Option<u64>,
+    resampler: Resampler,
+    stereo: Vec<f32>,
+    resampled: Vec<f32>,
+}
+
+impl Encoding {
+    fn new(frames_per_block: usize) -> Self {
+        Self {
+            client: None,
+            generation: None,
+            resampler: Resampler::new(),
+            stereo: Vec::with_capacity(2 * frames_per_block),
+            resampled: Vec::with_capacity(2 * frames_per_block),
+        }
+    }
 }
 
 fn write_block(
     file: &AacFile,
     block: &Block,
     formats: &Formats,
-    applied: &mut Option<Applied>,
-    stereo: &mut Vec<f32>,
+    encoding: &mut Encoding,
     silence: &mut Silence,
 ) -> Result<(), WriterError> {
     let Block {
@@ -213,34 +218,45 @@ fn write_block(
         host_time: _,
         generation,
     } = block;
-    let current = applied.map(
-        |Applied {
-             generation,
-             sample_rate: _,
-         }| generation,
-    );
-    match client_format(current, *generation, formats.rate(*generation)) {
-        ClientFormat::Unknown => return Ok(()),
-        ClientFormat::Keep => {}
-        ClientFormat::Apply(sample_rate) => {
-            file.set_client_format(sample_rate)?;
-            *applied = Some(Applied {
-                generation: *generation,
-                sample_rate,
-            });
-            silence.reset();
-        }
+    let Encoding {
+        client,
+        generation: written,
+        resampler,
+        stereo,
+        resampled,
+    } = encoding;
+
+    if *written != Some(*generation) {
+        silence.reset();
+        resampler.reset();
     }
-    let Some(Applied {
-        generation: _,
-        sample_rate,
-    }) = *applied
-    else {
+    *written = Some(*generation);
+
+    let conversion = conversion(*client, formats.rate(*generation));
+    match conversion {
+        Conversion::Unknown => return Ok(()),
+        Conversion::Establish(sample_rate) => {
+            file.set_client_format(sample_rate)?;
+            *client = Some(sample_rate);
+        }
+        Conversion::Direct => {}
+        Conversion::Resample { from: _, to: _ } => {}
+    }
+    let Some(client) = *client else {
         return Ok(());
     };
+
     fold(microphone, system, *frames, stereo);
-    silence.feed(stereo, block_duration(*frames, sample_rate));
-    file.write(stereo, *frames)
+    let (samples, frames) = match conversion {
+        Conversion::Unknown => return Ok(()),
+        Conversion::Establish(_) | Conversion::Direct => (&*stereo, *frames),
+        Conversion::Resample { from, to } => {
+            let frames = resampler.resample(stereo, *frames, from, to, resampled);
+            (&*resampled, frames)
+        }
+    };
+    silence.feed(samples, block_duration(frames, client));
+    file.write(samples, frames)
 }
 
 fn block_duration(frames: usize, sample_rate: f64) -> Duration {
@@ -250,29 +266,107 @@ fn block_duration(frames: usize, sample_rate: f64) -> Duration {
     Duration::from_secs_f64(frames as f64 / sample_rate)
 }
 
-/// ClientFormat is what a block needs done to the open file before it can be written.
+/// Conversion is what a block's captured rate needs before it can reach the open file.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum ClientFormat {
-    Apply(f64),
-    Keep,
+enum Conversion {
+    Establish(f64),
+    Direct,
+    Resample { from: f64, to: f64 },
     Unknown,
 }
 
-fn client_format(applied: Option<u64>, generation: u64, sample_rate: Option<f64>) -> ClientFormat {
-    let unchanged = match applied {
-        Some(applied) => applied == generation,
-        None => false,
-    };
-    if unchanged {
-        return ClientFormat::Keep;
-    }
-    let Some(sample_rate) = sample_rate else {
-        return match applied {
-            Some(_) => ClientFormat::Keep,
-            None => ClientFormat::Unknown,
+/// conversion decides how a block reaches a file whose client rate cannot be changed again.
+fn conversion(client: Option<f64>, sample_rate: Option<f64>) -> Conversion {
+    let Some(client) = client else {
+        let Some(sample_rate) = sample_rate else {
+            return Conversion::Unknown;
         };
+        return Conversion::Establish(sample_rate);
     };
-    ClientFormat::Apply(sample_rate)
+    let Some(sample_rate) = sample_rate else {
+        return Conversion::Direct;
+    };
+    if sample_rate == client {
+        return Conversion::Direct;
+    }
+    Conversion::Resample {
+        from: sample_rate,
+        to: client,
+    }
+}
+
+// A rebuild that changes the delivered rate cannot re-apply the client format: measured on this
+// machine, ExtAudioFile answers kExtAudioFileError_InvalidOperationOrder once writing has started,
+// and every later write fails too. So the rate the first block established stands for the life of
+// the file, and blocks captured at another rate are carried onto it here instead.
+struct Resampler {
+    previous: [f32; CHANNELS as usize],
+    position: f64,
+}
+
+impl Resampler {
+    fn new() -> Self {
+        Self {
+            previous: [0.0; CHANNELS as usize],
+            position: 0.0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn resample(
+        &mut self,
+        stereo: &[f32],
+        frames: usize,
+        from: f64,
+        to: f64,
+        out: &mut Vec<f32>,
+    ) -> usize {
+        out.clear();
+        if frames == 0 || from <= 0.0 || to <= 0.0 {
+            return 0;
+        }
+        let step = from / to;
+        let last = frames as f64 - 1.0;
+        let mut written = 0;
+        while self.position < last {
+            let index = self.position.floor();
+            let fraction = (self.position - index) as f32;
+            let index = index as isize;
+            for channel in 0..CHANNELS as usize {
+                let start = self.sample(stereo, index, channel);
+                let end = self.sample(stereo, index + 1, channel);
+                out.push(start + (end - start) * fraction);
+            }
+            written += 1;
+            self.position += step;
+        }
+        self.position -= frames as f64;
+
+        let mut previous = [0.0; CHANNELS as usize];
+        for (channel, sample) in previous.iter_mut().enumerate() {
+            *sample = self.sample(stereo, frames as isize - 1, channel);
+        }
+        self.previous = previous;
+        written
+    }
+
+    fn sample(&self, stereo: &[f32], index: isize, channel: usize) -> f32 {
+        let Self {
+            previous,
+            position: _,
+        } = self;
+        if index < 0 {
+            return previous[channel];
+        }
+        let offset = index as usize * CHANNELS as usize + channel;
+        if offset >= stereo.len() {
+            return 0.0;
+        }
+        stereo[offset]
+    }
 }
 
 /// fold interleaves the two tracks into stereo frames, the microphone left and the system right.
@@ -508,19 +602,32 @@ mod tests {
         stereo
     }
 
-    fn actions(generations: &[u64], formats: &Formats) -> Vec<ClientFormat> {
-        let mut applied = None;
-        let mut actions = Vec::new();
+    fn conversions(generations: &[u64], formats: &Formats) -> Vec<Conversion> {
+        let mut client = None;
+        let mut conversions = Vec::new();
         for generation in generations {
-            let action = client_format(applied, *generation, formats.rate(*generation));
-            match action {
-                ClientFormat::Apply(_) => applied = Some(*generation),
-                ClientFormat::Keep => {}
-                ClientFormat::Unknown => {}
+            let conversion = conversion(client, formats.rate(*generation));
+            match conversion {
+                Conversion::Establish(sample_rate) => client = Some(sample_rate),
+                Conversion::Direct => {}
+                Conversion::Resample { from: _, to: _ } => {}
+                Conversion::Unknown => {}
             }
-            actions.push(action);
+            conversions.push(conversion);
         }
-        actions
+        conversions
+    }
+
+    fn resampled(blocks: &[Vec<f32>], from: f64, to: f64) -> Vec<Vec<f32>> {
+        let mut resampler = Resampler::new();
+        let mut out = Vec::new();
+        let mut results = Vec::new();
+        for block in blocks {
+            let frames = block.len() / 2;
+            resampler.resample(block, frames, from, to, &mut out);
+            results.push(out.clone());
+        }
+        results
     }
 
     #[test]
@@ -577,59 +684,98 @@ mod tests {
     }
 
     #[test]
-    fn an_unchanged_generation_keeps_the_client_format() {
+    fn the_client_format_is_set_once_and_never_changed_again() {
         let formats = Formats::new();
         formats.publish(1, 48_000.0);
+        formats.publish(2, 48_000.0);
         assert_eq!(
-            client_format(Some(1), 1, formats.rate(1)),
-            ClientFormat::Keep
-        );
-    }
-
-    #[test]
-    fn a_changed_generation_applies_the_client_format_exactly_once() {
-        let formats = Formats::new();
-        formats.publish(1, 48_000.0);
-        formats.publish(2, 24_000.0);
-        assert_eq!(
-            actions(&[1, 1, 1, 2, 2, 2], &formats),
+            conversions(&[1, 1, 2, 2], &formats),
             vec![
-                ClientFormat::Apply(48_000.0),
-                ClientFormat::Keep,
-                ClientFormat::Keep,
-                ClientFormat::Apply(24_000.0),
-                ClientFormat::Keep,
-                ClientFormat::Keep,
+                Conversion::Establish(48_000.0),
+                Conversion::Direct,
+                Conversion::Direct,
+                Conversion::Direct,
             ]
         );
     }
 
     #[test]
-    fn frames_captured_at_the_old_rate_are_written_at_the_old_rate() {
+    fn a_generation_captured_at_another_rate_is_resampled_onto_the_established_one() {
         let formats = Formats::new();
         formats.publish(1, 48_000.0);
         formats.publish(2, 24_000.0);
         assert_eq!(
-            actions(&[1, 2, 1], &formats),
+            conversions(&[1, 2, 1], &formats),
             vec![
-                ClientFormat::Apply(48_000.0),
-                ClientFormat::Apply(24_000.0),
-                ClientFormat::Apply(48_000.0),
+                Conversion::Establish(48_000.0),
+                Conversion::Resample {
+                    from: 24_000.0,
+                    to: 48_000.0
+                },
+                Conversion::Direct,
             ],
-            "a block queued at the old rate re-applies that rate rather than the current one"
+            "the open file keeps the rate its first block established"
         );
     }
 
     #[test]
-    fn a_generation_without_a_published_rate_is_undecidable_until_one_was_applied() {
+    fn a_generation_without_a_published_rate_is_undecidable_until_one_was_established() {
         let formats = Formats::new();
+        assert_eq!(conversion(None, formats.rate(1)), Conversion::Unknown);
         assert_eq!(
-            client_format(None, 1, formats.rate(1)),
-            ClientFormat::Unknown
+            conversion(Some(48_000.0), formats.rate(2)),
+            Conversion::Direct
+        );
+    }
+
+    #[test]
+    fn halving_the_rate_halves_the_frames_and_keeps_the_samples_it_lands_on() {
+        let block = vec![0.0, 0.0, 0.25, -0.25, 0.5, -0.5, 0.75, -0.75];
+        let blocks = resampled(&[block], 48_000.0, 24_000.0);
+        assert_eq!(blocks, vec![vec![0.0, 0.0, 0.5, -0.5]]);
+    }
+
+    #[test]
+    fn doubling_the_rate_interpolates_between_the_frames_it_was_given() {
+        let block = vec![0.0, 1.0, 1.0, 0.0];
+        let blocks = resampled(&[block], 24_000.0, 48_000.0);
+        assert_eq!(blocks, vec![vec![0.0, 1.0, 0.5, 0.5]]);
+    }
+
+    #[test]
+    fn an_unchanged_rate_carries_the_frames_through_untouched() {
+        let block = vec![0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4];
+        let blocks = resampled(std::slice::from_ref(&block), 24_000.0, 24_000.0);
+        assert_eq!(blocks[0].len(), block.len() - 2);
+        assert_eq!(blocks[0], block[..block.len() - 2]);
+    }
+
+    #[test]
+    fn the_next_block_continues_where_the_previous_one_stopped() {
+        let first = vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0];
+        let second = vec![3.0, 3.0, 4.0, 4.0, 5.0, 5.0];
+        let blocks = resampled(&[first, second], 30_000.0, 24_000.0);
+        assert_eq!(blocks[0], vec![0.0, 0.0, 1.25, 1.25]);
+        assert_eq!(
+            blocks[1],
+            vec![2.5, 2.5, 3.75, 3.75],
+            "the fraction left over by a block is carried into the next one"
+        );
+    }
+
+    #[test]
+    fn a_block_of_no_frames_resamples_to_nothing() {
+        assert_eq!(
+            resampled(&[Vec::new()], 24_000.0, 48_000.0),
+            vec![Vec::new()]
         );
         assert_eq!(
-            client_format(Some(1), 2, formats.rate(2)),
-            ClientFormat::Keep
+            resampled(&[vec![0.5, 0.5]], 0.0, 48_000.0),
+            vec![Vec::new()]
+        );
+        assert_eq!(
+            resampled(&[vec![0.5, 0.5]], 24_000.0, 0.0),
+            vec![Vec::new()]
         );
     }
 
@@ -751,6 +897,54 @@ mod tests {
             Verdict::AudioPresent,
             "the window a rebuild opened must judge the new capture, not the silent one before it"
         );
+    }
+
+    #[test]
+    fn a_rebuild_that_changes_the_delivered_rate_keeps_writing_the_same_file() {
+        let file = TempFile::new();
+        let formats = Formats::new();
+        formats.publish(1, 48_000.0);
+        formats.publish(2, 24_000.0);
+
+        let (producer, consumer) = ring(64, 4096);
+        let microphone = vec![0.25; 4096];
+        let system = vec![-0.25; 4096];
+        for round in 0..4 {
+            producer.push(BlockRef {
+                microphone: &microphone,
+                system: &system,
+                frames: 4096,
+                host_time: round,
+                generation: 1,
+            });
+        }
+        for round in 4..8 {
+            producer.push(BlockRef {
+                microphone: &microphone,
+                system: &system,
+                frames: 4096,
+                host_time: round,
+                generation: 2,
+            });
+        }
+
+        let writer = spawn(
+            WriterSettings {
+                path: file.path().to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(
+            error, None,
+            "a rate change must be resampled, not re-applied to the open file"
+        );
+        assert_eq!(verdict, Verdict::AudioPresent);
+        let written = fs::metadata(file.path()).expect("the writer created the file");
+        assert!(written.len() > 0);
     }
 
     #[test]

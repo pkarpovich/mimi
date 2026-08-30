@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::ffi::CStr;
 use std::ptr::NonNull;
+use std::thread;
 
 use block2::RcBlock;
 use objc2::AllocAnyThread;
@@ -20,8 +21,11 @@ use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
+use super::devices::{self, Rebuild};
 use super::layout::{self, Buffer, Tracks};
-use super::{BlockRef, Capture, CaptureConfig, CaptureError, Formats, Producer, TrackKind};
+use super::{
+    BlockRef, Capture, CaptureConfig, CaptureError, Formats, Producer, Rebuilds, TrackKind,
+};
 use crate::activity::{DeviceUid, Devices};
 use crate::macos;
 
@@ -42,6 +46,8 @@ pub struct Tap {
     tracks: Vec<TrackKind>,
     generation: u64,
     formats: Formats,
+    built: Option<Devices>,
+    rebuilds: Rebuilds,
 }
 
 impl Tap {
@@ -57,6 +63,8 @@ impl Tap {
             tracks: Vec::new(),
             generation: 0,
             formats: Formats::new(),
+            built: None,
+            rebuilds: Rebuilds::default(),
         }
     }
 
@@ -148,18 +156,38 @@ impl Tap {
 impl Capture for Tap {
     fn start(&mut self, devices: &Devices, producer: Producer) -> Result<(), CaptureError> {
         self.teardown();
+        self.built = None;
+        self.rebuilds = Rebuilds::default();
         self.producer = Some(producer);
-        self.build(devices)
+        self.build(devices)?;
+        self.built = Some(devices.clone());
+        Ok(())
     }
 
     fn stop(&mut self) {
         self.teardown();
         self.producer = None;
+        self.built = None;
     }
 
     fn rebuild(&mut self, devices: &Devices) -> Result<(), CaptureError> {
+        let Some(built) = self.built.clone() else {
+            return Err(CaptureError::NotStarted);
+        };
+        match devices::rebuild_needed(&built, devices) {
+            Rebuild::NotRequired => return Ok(()),
+            Rebuild::Required => {}
+        }
+
         self.teardown();
-        self.build(devices)
+        let rebuilt = devices::with_retries(thread::sleep, || self.build(devices));
+        let Err(error) = rebuilt else {
+            self.built = Some(devices.clone());
+            self.rebuilds.succeeded += 1;
+            return Ok(());
+        };
+        self.rebuilds.failed += 1;
+        Err(error)
     }
 
     fn sample_rate(&self) -> Option<f64> {
@@ -172,6 +200,10 @@ impl Capture for Tap {
 
     fn formats(&self) -> Formats {
         self.formats.clone()
+    }
+
+    fn rebuilds(&self) -> Rebuilds {
+        self.rebuilds
     }
 }
 
@@ -760,5 +792,29 @@ mod tests {
             sample_rate: Some(48_000.0),
         };
         assert_eq!(capture.rebuild(&devices), Err(CaptureError::NotStarted));
+        assert_eq!(capture.rebuilds(), Rebuilds::default());
+    }
+
+    #[test]
+    fn a_build_that_failed_leaves_no_baseline_to_rebuild_against() {
+        let mut capture = Tap::new(CaptureConfig::new("mimi", "dev.pkarpovich.mimi.aggregate"));
+        let devices = Devices {
+            input: None,
+            output: None,
+            sample_rate: None,
+        };
+        let (producer, _consumer) = crate::capture::ring(2, 8);
+        assert_eq!(
+            capture.start(&devices, producer),
+            Err(CaptureError::NoOutputDevice)
+        );
+        assert_eq!(
+            capture.rebuild(&devices),
+            Err(CaptureError::NotStarted),
+            "a baseline is kept only after a start that actually built capture"
+        );
+        let Rebuilds { succeeded, failed } = capture.rebuilds();
+        assert_eq!(succeeded, 0);
+        assert_eq!(failed, 0);
     }
 }

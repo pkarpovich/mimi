@@ -1,3 +1,4 @@
+mod devices;
 mod layout;
 mod ring;
 mod silence;
@@ -40,7 +41,7 @@ impl CaptureConfig {
     }
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum CaptureError {
     #[error("capture was not started")]
     NotStarted,
@@ -58,6 +59,13 @@ pub enum CaptureError {
     NoSampleRate,
 }
 
+/// Rebuilds counts what device changes did to a session's capture, for the sidecar to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Rebuilds {
+    pub succeeded: u32,
+    pub failed: u32,
+}
+
 /// Capture owns the tap and the aggregate device that deliver the two tracks.
 pub trait Capture {
     fn start(&mut self, devices: &Devices, producer: Producer) -> Result<(), CaptureError>;
@@ -66,6 +74,7 @@ pub trait Capture {
     fn sample_rate(&self) -> Option<f64>;
     fn tracks(&self) -> &[TrackKind];
     fn formats(&self) -> Formats;
+    fn rebuilds(&self) -> Rebuilds;
 }
 
 /// Formats carries the delivered rate of each capture generation to the writer thread.

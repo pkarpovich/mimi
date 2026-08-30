@@ -22,7 +22,9 @@ use chrono::Local;
 
 use crate::activity::poller::{self, CoreAudio};
 use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
-use crate::capture::{Capture, CaptureConfig, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Tap};
+use crate::capture::{
+    Capture, CaptureConfig, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Rebuilds, Tap,
+};
 use crate::config::Config;
 use crate::session::{Decider, SessionCommand, SessionStart};
 use crate::writer::{Finished, Writer, WriterSettings};
@@ -157,6 +159,7 @@ fn run() -> ExitCode {
                 }
                 SessionCommand::Stop => {
                     capture.stop();
+                    let Rebuilds { succeeded, failed } = capture.rebuilds();
                     match recording.take() {
                         Some(Recording { path, writer }) => {
                             let Finished { error, verdict } = writer.finish();
@@ -164,9 +167,11 @@ fn run() -> ExitCode {
                                 Some(error) => {
                                     eprintln!("mimi: writing {} failed: {error}", path.display());
                                 }
-                                None => {
-                                    println!("session stop: wrote {} ({verdict:?})", path.display())
-                                }
+                                None => println!(
+                                    "session stop: wrote {} ({verdict:?}, {succeeded} rebuilds, \
+                                     {failed} failed)",
+                                    path.display()
+                                ),
                             }
                         }
                         None => println!("session stop"),
@@ -184,7 +189,7 @@ fn run() -> ExitCode {
                 println!("devices changed: {sampled:?}");
                 devices = sampled;
                 if recording.is_some() {
-                    rebuild_capture(&mut capture, &devices);
+                    session::devices_changed(&mut capture, &devices);
                 }
             }
             ActivityEvent::Tick => {}
@@ -242,14 +247,6 @@ fn start_recording(capture: &mut Tap, devices: &Devices, output: &Output<'_>) ->
     };
     eprintln!("mimi: capture did not start: {error}");
     None
-}
-
-fn rebuild_capture(capture: &mut Tap, devices: &Devices) {
-    let Err(error) = capture.rebuild(devices) else {
-        println!("capture rebuilt: {:?} Hz", capture.sample_rate());
-        return;
-    };
-    eprintln!("mimi: capture did not rebuild: {error}");
 }
 
 fn describe(process: &AudioProcess) -> String {
