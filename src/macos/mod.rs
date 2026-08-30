@@ -11,6 +11,11 @@ use objc2_core_foundation::{CFRetained, CFString};
 
 pub const SYSTEM_OBJECT: AudioObjectID = kAudioObjectSystemObject as AudioObjectID;
 
+/// user_id is the uid launchd addresses this user's agent domain by.
+pub fn user_id() -> u32 {
+    unsafe { libc::getuid() }
+}
+
 /// Scalar marks the types a Core Audio property may be read into byte-for-byte; implementing it for
 /// a type that is not a plain fixed-size value would let `read_scalar` build an invalid one.
 pub trait Scalar: Copy {}
@@ -142,6 +147,11 @@ mod tests {
     #[test]
     fn unknown_object_list_property_yields_none() {
         assert_eq!(read_object_ids(SYSTEM_OBJECT, UNKNOWN_SELECTOR), None);
+    }
+
+    #[test]
+    fn the_user_id_is_the_one_the_process_runs_as() {
+        assert_eq!(user_id(), user_id(), "the uid does not change under us");
     }
 
     #[test]

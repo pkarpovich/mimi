@@ -7,6 +7,7 @@ mod activity;
 mod capture;
 mod config;
 mod macos;
+mod service;
 mod session;
 mod sink;
 mod writer;
@@ -18,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use argh::FromArgs;
+use tracing::Level;
 
 use crate::activity::DeviceSource;
 use crate::activity::poller::{self, CoreAudio};
@@ -106,6 +108,11 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn run() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_max_level(Level::INFO)
+        .init();
+
     let Some(home) = home_dir() else {
         eprintln!("mimi: HOME is not set");
         return ExitCode::FAILURE;
@@ -160,9 +167,38 @@ fn run() -> ExitCode {
 }
 
 fn install() -> ExitCode {
-    ExitCode::SUCCESS
+    let Some(home) = home_dir() else {
+        eprintln!("mimi: HOME is not set");
+        return ExitCode::FAILURE;
+    };
+    match service::install(&home, macos::user_id()) {
+        Ok(agent) => {
+            println!("mimi: {} is loaded", agent.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("mimi: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn uninstall() -> ExitCode {
-    ExitCode::SUCCESS
+    let Some(home) = home_dir() else {
+        eprintln!("mimi: HOME is not set");
+        return ExitCode::FAILURE;
+    };
+    match service::uninstall(&home, macos::user_id()) {
+        Ok(agent) => {
+            println!(
+                "mimi: {} is gone; recordings were left alone",
+                agent.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("mimi: {error}");
+            ExitCode::FAILURE
+        }
+    }
 }

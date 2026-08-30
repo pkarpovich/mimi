@@ -210,8 +210,8 @@ fn finish_session(
         error!("writing {} failed: {failure}", partial.display());
     }
     match verdict {
-        Verdict::AudioPresent => {}
-        Verdict::Undecided => {}
+        Verdict::AudioPresent => info!("{} opened with audio present", partial.display()),
+        Verdict::Undecided => info!("{} was too short to judge for silence", partial.display()),
         Verdict::Silent => warn!("{} opened on digital silence", partial.display()),
     }
 
@@ -235,7 +235,13 @@ fn finish_session(
 
 /// devices_changed forwards a device change to capture, which rebuilds only if it has to.
 pub fn devices_changed(capture: &mut impl Capture, devices: &Devices) {
+    let Devices {
+        input,
+        output,
+        sample_rate,
+    } = devices;
     let Err(failure) = capture.rebuild(devices) else {
+        info!("the devices changed to input {input:?}, output {output:?}, {sample_rate:?} Hz");
         return;
     };
     error!("capture did not rebuild on the current devices: {failure}");
