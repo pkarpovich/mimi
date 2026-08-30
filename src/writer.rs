@@ -301,7 +301,7 @@ fn conversion(client: Option<f64>, sample_rate: Option<f64>) -> Conversion {
         return Conversion::Establish(sample_rate);
     };
     let Some(sample_rate) = sample_rate else {
-        return Conversion::Direct(client);
+        return Conversion::Unknown;
     };
     if sample_rate == client {
         return Conversion::Direct(client);
@@ -736,12 +736,14 @@ mod tests {
     }
 
     #[test]
-    fn a_generation_without_a_published_rate_is_undecidable_until_one_was_established() {
+    fn a_generation_without_a_published_rate_is_undecidable_whatever_was_established() {
         let formats = Formats::new();
         assert_eq!(conversion(None, formats.rate(1)), Conversion::Unknown);
         assert_eq!(
             conversion(Some(48_000.0), formats.rate(2)),
-            Conversion::Direct(48_000.0)
+            Conversion::Unknown,
+            "a build publishes its rate only after the IOProc is running, and a block that arrived \
+             in between would otherwise be written at the rate the generation before it settled on"
         );
     }
 

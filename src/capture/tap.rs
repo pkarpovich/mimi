@@ -112,13 +112,13 @@ impl Tap {
         if status != 0 {
             return Err(CaptureError::DeviceStart(status));
         }
+        self.io = Io::Running;
 
         let Some(sample_rate) = settled_rate(aggregate) else {
             return Err(CaptureError::NoSampleRate);
         };
         self.sample_rate = Some(sample_rate);
         self.formats.publish(self.generation, sample_rate);
-        self.io = Io::Running;
         self.tracks = tracks(devices);
         Ok(())
     }
