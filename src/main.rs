@@ -4,6 +4,7 @@
 mod plist;
 
 mod activity;
+mod capture;
 mod config;
 mod macos;
 mod session;
@@ -17,8 +18,12 @@ use std::time::{Duration, Instant};
 use argh::FromArgs;
 
 use crate::activity::poller::{self, CoreAudio};
-use crate::activity::{ActivityEvent, AudioProcess};
+use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
+use crate::capture::{Capture, CaptureConfig, Producer, Tap};
 use crate::session::{Decider, SessionCommand, SessionStart};
+
+const AGGREGATE_NAME: &str = "mimi";
+const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -112,6 +117,10 @@ fn run() -> ExitCode {
     let interval = Duration::from_millis(config.poll_interval_ms.into());
     let grace = Duration::from_secs(config.stop_grace_seconds.into());
     let mut decider = Decider::new(config.meeting_bundle_prefixes, grace);
+    let sampler = CoreAudio::live();
+    let mut devices = sampler.devices();
+    let mut capture = Tap::new(CaptureConfig::new(AGGREGATE_NAME, AGGREGATE_UID));
+    let mut recording: Option<Producer> = None;
     let (events, incoming) = mpsc::channel();
     let (_stop, stopped) = mpsc::channel();
     thread::spawn(move || poller::poll(&CoreAudio::live(), interval, stopped, events));
@@ -121,8 +130,18 @@ fn run() -> ExitCode {
             match command {
                 SessionCommand::Start(SessionStart { bundle_id, label }) => {
                     println!("session start: {label} ({})", bundle_id.as_str());
+                    recording = start_capture(&mut capture, &devices);
                 }
-                SessionCommand::Stop => println!("session stop"),
+                SessionCommand::Stop => {
+                    capture.stop();
+                    match &recording {
+                        Some(producer) => {
+                            println!("session stop: {} blocks delivered", producer.delivered());
+                        }
+                        None => println!("session stop"),
+                    }
+                    recording = None;
+                }
             }
         }
         match event {
@@ -130,12 +149,40 @@ fn run() -> ExitCode {
             ActivityEvent::InputReleased(process) => {
                 println!("input released by {}", describe(&process));
             }
-            ActivityEvent::DevicesChanged(devices) => println!("devices changed: {devices:?}"),
+            ActivityEvent::DevicesChanged(sampled) => {
+                println!("devices changed: {sampled:?}");
+                devices = sampled;
+                if recording.is_some() {
+                    rebuild_capture(&mut capture, &devices);
+                }
+            }
             ActivityEvent::Tick => {}
         }
     }
 
     ExitCode::SUCCESS
+}
+
+fn start_capture(capture: &mut Tap, devices: &Devices) -> Option<Producer> {
+    let producer = Producer::new();
+    let Err(error) = capture.start(devices, producer.clone()) else {
+        println!(
+            "capture started: {:?} Hz, tracks {:?}",
+            capture.sample_rate(),
+            capture.tracks()
+        );
+        return Some(producer);
+    };
+    eprintln!("mimi: capture did not start: {error}");
+    None
+}
+
+fn rebuild_capture(capture: &mut Tap, devices: &Devices) {
+    let Err(error) = capture.rebuild(devices) else {
+        println!("capture rebuilt: {:?} Hz", capture.sample_rate());
+        return;
+    };
+    eprintln!("mimi: capture did not rebuild: {error}");
 }
 
 fn describe(process: &AudioProcess) -> String {

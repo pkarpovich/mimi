@@ -53,6 +53,11 @@ impl DeviceUid {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    pub fn as_str(&self) -> &str {
+        let Self(value) = self;
+        value
+    }
 }
 
 /// Devices is the default input and output devices with the rate they currently deliver.
