@@ -9,10 +9,14 @@ mod macos;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use argh::FromArgs;
 
-use crate::activity::AudioProcess;
+use crate::activity::poller::{self, CoreAudio};
+use crate::activity::{ActivityEvent, AudioProcess};
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -64,8 +68,6 @@ fn main() -> ExitCode {
         Some(Command::Install(InstallCommand {})) => install(),
         Some(Command::Uninstall(UninstallCommand {})) => uninstall(),
     }
-
-    ExitCode::SUCCESS
 }
 
 fn print_config() -> ExitCode {
@@ -92,23 +94,57 @@ fn home_dir() -> Option<PathBuf> {
     Some(PathBuf::from(home))
 }
 
-fn run() {
-    for process in activity::audio_processes() {
-        let AudioProcess {
-            object,
-            bundle_id,
-            pid,
-            input,
-            output,
-        } = process;
-        let bundle_id = match bundle_id {
-            Some(bundle_id) => bundle_id.as_str().to_owned(),
-            None => String::from("<unknown>"),
-        };
-        println!("{object} pid={pid} {bundle_id} input={input:?} output={output:?}");
+fn run() -> ExitCode {
+    let Some(home) = home_dir() else {
+        eprintln!("mimi: HOME is not set");
+        return ExitCode::FAILURE;
+    };
+    let config = match config::load(&home) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("mimi: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let interval = Duration::from_millis(config.poll_interval_ms.into());
+    let (events, incoming) = mpsc::channel();
+    let (_stop, stopped) = mpsc::channel();
+    thread::spawn(move || poller::poll(&CoreAudio::live(), interval, stopped, events));
+
+    for event in incoming {
+        match event {
+            ActivityEvent::InputTaken(process) => println!("input taken by {}", describe(&process)),
+            ActivityEvent::InputReleased(process) => {
+                println!("input released by {}", describe(&process));
+            }
+            ActivityEvent::DevicesChanged(devices) => println!("devices changed: {devices:?}"),
+            ActivityEvent::Tick => {}
+        }
     }
+
+    ExitCode::SUCCESS
 }
 
-fn install() {}
+fn describe(process: &AudioProcess) -> String {
+    let AudioProcess {
+        object,
+        bundle_id,
+        pid,
+        input: _,
+        output: _,
+    } = process;
+    let bundle_id = match bundle_id {
+        Some(bundle_id) => bundle_id.as_str(),
+        None => "<unknown>",
+    };
+    format!("{object} pid={pid} {bundle_id}")
+}
 
-fn uninstall() {}
+fn install() -> ExitCode {
+    ExitCode::SUCCESS
+}
+
+fn uninstall() -> ExitCode {
+    ExitCode::SUCCESS
+}

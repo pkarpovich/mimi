@@ -1,3 +1,6 @@
+mod diff;
+pub mod poller;
+
 use objc2_core_audio::{
     AudioObjectID, AudioObjectPropertySelector, kAudioHardwarePropertyProcessObjectList,
     kAudioProcessPropertyBundleID, kAudioProcessPropertyIsRunningInput,
@@ -40,6 +43,43 @@ pub struct AudioProcess {
     pub pid: i32,
     pub input: InputState,
     pub output: OutputState,
+}
+
+/// DeviceUid is the unique identifier Core Audio reports for an audio device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceUid(String);
+
+impl DeviceUid {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+}
+
+/// Devices is the default input and output devices with the rate they currently deliver.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Devices {
+    pub input: Option<DeviceUid>,
+    pub output: Option<DeviceUid>,
+    pub sample_rate: Option<f64>,
+}
+
+/// ActivityEvent is what one poll of the audio system observed.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ActivityEvent {
+    InputTaken(AudioProcess),
+    InputReleased(AudioProcess),
+    DevicesChanged(Devices),
+    Tick,
+}
+
+/// ActivitySource answers which processes Core Audio currently knows about.
+pub trait ActivitySource {
+    fn snapshot(&self) -> Vec<AudioProcess>;
+}
+
+/// DeviceSource answers which devices are current and at what rate they run.
+pub trait DeviceSource {
+    fn devices(&self) -> Devices;
 }
 
 /// audio_processes lists the processes Core Audio currently knows about.
