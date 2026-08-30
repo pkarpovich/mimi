@@ -111,6 +111,10 @@ pub fn run(
             match command {
                 SessionCommand::Start(start) => {
                     session = start_session(capture, &devices, &output, start);
+                    match &session {
+                        Some(_) => {}
+                        None => decider.abandon(),
+                    }
                 }
                 SessionCommand::Stop => finish_session(capture, sink, &output, session.take()),
             }
@@ -227,7 +231,7 @@ fn finish_session(
         verdict,
     };
     let Err(failure) = sink.accept(recording) else {
-        info!("session ended after {succeeded} rebuilds, {failed} of them exhausted");
+        info!("session ended after {succeeded} rebuilds and {failed} exhausted ones");
         return;
     };
     error!("the recording was not completed: {failure}");
@@ -294,7 +298,9 @@ mod tests {
         rebuilt: Vec<Devices>,
         starts: usize,
         stops: usize,
+        rebuilds: Rebuilds,
         failure: Option<CaptureError>,
+        start_failure: Option<CaptureError>,
     }
 
     impl FakeCapture {
@@ -303,15 +309,27 @@ mod tests {
                 rebuilt: Vec::new(),
                 starts: 0,
                 stops: 0,
+                rebuilds: Rebuilds::default(),
                 failure,
+                start_failure: None,
             }
+        }
+
+        fn failing_to_start(failure: CaptureError) -> Self {
+            let mut capture = Self::new(None);
+            capture.start_failure = Some(failure);
+            capture
         }
     }
 
     impl Capture for FakeCapture {
         fn start(&mut self, _devices: &Devices, _producer: Producer) -> Result<(), CaptureError> {
             self.starts += 1;
-            Ok(())
+            self.rebuilds = Rebuilds::default();
+            let Some(failure) = self.start_failure else {
+                return Ok(());
+            };
+            Err(failure)
         }
 
         fn stop(&mut self) {
@@ -321,8 +339,10 @@ mod tests {
         fn rebuild(&mut self, devices: &Devices) -> Result<(), CaptureError> {
             self.rebuilt.push(devices.clone());
             let Some(failure) = self.failure else {
+                self.rebuilds.succeeded += 1;
                 return Ok(());
             };
+            self.rebuilds.failed += 1;
             Err(failure)
         }
 
@@ -339,10 +359,7 @@ mod tests {
         }
 
         fn rebuilds(&self) -> Rebuilds {
-            Rebuilds {
-                succeeded: self.rebuilt.len() as u32,
-                failed: 0,
-            }
+            self.rebuilds
         }
     }
 
@@ -588,6 +605,84 @@ mod tests {
             "the meeting still in progress is handed to the sink"
         );
         assert_eq!(capture.stops, 1);
+    }
+
+    #[test]
+    fn an_exhausted_rebuild_keeps_the_recording_and_is_reported_in_the_sidecar() {
+        let dir = TempDir::new();
+        let mut capture = FakeCapture::new(Some(CaptureError::NoOutputDevice));
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+
+        events
+            .send(ActivityEvent::InputTaken(process(InputState::Running)))
+            .expect("send the take");
+        events
+            .send(ActivityEvent::DevicesChanged(devices(
+                "20-F4-D4-60-E4-29:input",
+            )))
+            .expect("send the device change");
+        drop(events);
+
+        run(
+            settings(dir.path(), Duration::from_millis(10)),
+            devices("BuiltInMicrophoneDevice"),
+            &mut capture,
+            &sink,
+            incoming,
+            &shutdown,
+        );
+
+        let accepted = sink.accepted();
+        assert_eq!(accepted.len(), 1, "an exhausted rebuild keeps the file");
+        assert_eq!(accepted[0].device_changes, 0);
+        assert_eq!(
+            accepted[0].failed_device_changes, 1,
+            "a capture that never came back must say so in the sidecar"
+        );
+    }
+
+    #[test]
+    fn a_capture_that_does_not_start_records_nothing_and_is_attempted_again() {
+        let dir = TempDir::new();
+        let mut capture = FakeCapture::failing_to_start(CaptureError::NoOutputDevice);
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+
+        events
+            .send(ActivityEvent::InputTaken(process(InputState::Running)))
+            .expect("send the take");
+        events
+            .send(ActivityEvent::InputTaken(AudioProcess {
+                object: 12,
+                bundle_id: Some(BundleId::new("company.thebrowser.browser.helper")),
+                pid: 4243,
+                input: InputState::Running,
+                output: OutputState::Idle,
+            }))
+            .expect("send the second take");
+        drop(events);
+
+        run(
+            settings(dir.path(), Duration::from_millis(10)),
+            devices("BuiltInMicrophoneDevice"),
+            &mut capture,
+            &sink,
+            incoming,
+            &shutdown,
+        );
+
+        assert_eq!(
+            capture.starts, 2,
+            "the next holder of the microphone must be given another attempt"
+        );
+        assert_eq!(sink.accepted().len(), 0, "nothing was recorded");
+        assert!(
+            !recording_in_progress(&dir.path()),
+            "a capture that never started leaves no file behind"
+        );
     }
 
     #[test]

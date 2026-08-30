@@ -61,6 +61,12 @@ impl Decider {
         commands
     }
 
+    /// abandon forgets a session the run loop could not start, so the next take tries again.
+    pub fn abandon(&mut self) {
+        self.state = State::Idle;
+        self.holders.clear();
+    }
+
     fn grace_elapsed(&self, now: Instant) -> bool {
         let State::PendingStop { since } = self.state else {
             return false;
@@ -260,6 +266,28 @@ mod tests {
         assert_eq!(
             decider.observe(&taken(1, "company.thebrowser.browser.helper"), now),
             vec![start("company.thebrowser.browser.helper", "thebrowser")]
+        );
+    }
+
+    #[test]
+    fn an_abandoned_session_is_started_again_by_the_next_take() {
+        let mut decider = decider();
+        let now = Instant::now();
+        assert_eq!(
+            decider.observe(&taken(1, "us.zoom.xos"), now),
+            vec![start("us.zoom.xos", "zoom")]
+        );
+        assert_eq!(
+            decider.observe(&taken(2, "us.zoom.caphost"), now),
+            vec![],
+            "a second holder of a running session does not start a second one"
+        );
+
+        decider.abandon();
+        assert_eq!(
+            decider.observe(&taken(2, "us.zoom.caphost"), now),
+            vec![start("us.zoom.caphost", "zoom")],
+            "a session that never started must be attempted again"
         );
     }
 

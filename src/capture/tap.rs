@@ -21,7 +21,7 @@ use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
-use super::devices::{self, Rebuild};
+use super::devices::{self, Io, Rebuild};
 use super::layout::{self, Buffer, Tracks};
 use super::{
     BlockRef, Capture, CaptureConfig, CaptureError, Formats, Producer, Rebuilds, TrackKind,
@@ -174,7 +174,7 @@ impl Capture for Tap {
         let Some(built) = self.built.clone() else {
             return Err(CaptureError::NotStarted);
         };
-        match devices::rebuild_needed(&built, devices) {
+        match devices::rebuild_needed(self.io, &built, devices) {
             Rebuild::NotRequired => return Ok(()),
             Rebuild::Required => {}
         }
@@ -211,12 +211,6 @@ impl Drop for Tap {
     fn drop(&mut self) {
         self.teardown();
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Io {
-    Running,
-    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

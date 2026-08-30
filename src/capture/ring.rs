@@ -220,6 +220,8 @@ fn load_samples(slots: &[AtomicU32], len: usize, samples: &mut Vec<f32>) {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
+
     use super::*;
 
     fn block(host_time: u64) -> BlockRef<'static> {
@@ -342,6 +344,71 @@ mod tests {
         let (producer, consumer) = ring(4, 512);
         assert_eq!(producer.frames_per_block(), 512);
         assert_eq!(consumer.frames_per_block(), 512);
+    }
+
+    #[test]
+    fn a_block_crossing_the_threads_arrives_whole_and_in_order() {
+        const BLOCKS: u64 = 20_000;
+        let (producer, mut consumer) = ring(64, 32);
+        let pushing = thread::spawn(move || {
+            for round in 0..BLOCKS {
+                let samples = vec![round as f32; 32];
+                producer.push(BlockRef {
+                    microphone: &samples,
+                    system: &samples,
+                    frames: 32,
+                    host_time: round,
+                    generation: round,
+                });
+            }
+        });
+
+        let mut seen = 0;
+        let mut dropped = 0;
+        let mut previous = None;
+        while seen + dropped < BLOCKS {
+            let Drained {
+                blocks,
+                dropped: missed,
+            } = consumer.drain();
+            dropped += missed;
+            for block in blocks {
+                let Block {
+                    microphone,
+                    system,
+                    frames,
+                    host_time,
+                    generation,
+                } = block;
+                assert_eq!(*frames, 32);
+                assert_eq!(
+                    *generation, *host_time,
+                    "a block was torn between two pushes"
+                );
+                assert_eq!(
+                    microphone,
+                    &vec![*host_time as f32; 32],
+                    "the microphone track carries samples from another block"
+                );
+                assert_eq!(
+                    system, microphone,
+                    "the two tracks came from different blocks"
+                );
+                let Some(before) = previous else {
+                    previous = Some(*host_time);
+                    seen += 1;
+                    continue;
+                };
+                assert!(
+                    *host_time > before,
+                    "blocks reached the writer out of order: {host_time} after {before}"
+                );
+                previous = Some(*host_time);
+                seen += 1;
+            }
+        }
+        pushing.join().expect("the producer thread");
+        assert_eq!(seen + dropped, BLOCKS);
     }
 
     #[test]

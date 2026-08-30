@@ -15,8 +15,19 @@ pub enum Rebuild {
     NotRequired,
 }
 
+/// Io is whether capture is still delivering, or was left down by a rebuild that never came back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Io {
+    Running,
+    Stopped,
+}
+
 /// rebuild_needed compares the devices capture was built on with the ones current now.
-pub fn rebuild_needed(built: &Devices, current: &Devices) -> Rebuild {
+pub fn rebuild_needed(io: Io, built: &Devices, current: &Devices) -> Rebuild {
+    match io {
+        Io::Stopped => return Rebuild::Required,
+        Io::Running => {}
+    }
     let Devices {
         input,
         output,
@@ -44,18 +55,17 @@ pub fn with_retries<E>(
     mut settle: impl FnMut(Duration),
     mut build: impl FnMut() -> Result<(), E>,
 ) -> Result<(), E> {
-    let mut failure = None;
-    for _ in 0..ATTEMPTS {
+    let mut attempts = 0;
+    loop {
         settle(SETTLE);
+        attempts += 1;
         let Err(error) = build() else {
             return Ok(());
         };
-        failure = Some(error);
+        if attempts == ATTEMPTS {
+            return Err(error);
+        }
     }
-    let Some(error) = failure else {
-        return Ok(());
-    };
-    Err(error)
 }
 
 #[cfg(test)]
@@ -83,7 +93,10 @@ mod tests {
 
     #[test]
     fn unchanged_devices_at_an_unchanged_rate_keep_the_capture() {
-        assert_eq!(rebuild_needed(&airpods(), &airpods()), Rebuild::NotRequired);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &airpods()),
+            Rebuild::NotRequired
+        );
     }
 
     #[test]
@@ -93,7 +106,10 @@ mod tests {
             Some("BuiltInSpeakerDevice"),
             Some(24_000.0),
         );
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
     }
 
     #[test]
@@ -103,7 +119,10 @@ mod tests {
             Some("20-F4-D4-60-E4-29:output"),
             Some(24_000.0),
         );
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
     }
 
     #[test]
@@ -113,16 +132,25 @@ mod tests {
             Some("BuiltInSpeakerDevice"),
             Some(48_000.0),
         );
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
     }
 
     #[test]
     fn a_device_disappearing_forces_a_rebuild() {
         let current = devices(None, Some("20-F4-D4-60-E4-29:output"), Some(24_000.0));
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
 
         let current = devices(Some("20-F4-D4-60-E4-29:input"), None, Some(24_000.0));
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
     }
 
     #[test]
@@ -133,7 +161,7 @@ mod tests {
             Some(48_000.0),
         );
         assert_eq!(
-            rebuild_needed(&airpods(), &current),
+            rebuild_needed(Io::Running, &airpods(), &current),
             Rebuild::Required,
             "AirPods entering headset mode change rate without changing UID"
         );
@@ -143,7 +171,19 @@ mod tests {
             Some("20-F4-D4-60-E4-29:output"),
             None,
         );
-        assert_eq!(rebuild_needed(&airpods(), &current), Rebuild::Required);
+        assert_eq!(
+            rebuild_needed(Io::Running, &airpods(), &current),
+            Rebuild::Required
+        );
+    }
+
+    #[test]
+    fn capture_left_down_is_rebuilt_even_on_the_devices_it_was_built_for() {
+        assert_eq!(
+            rebuild_needed(Io::Stopped, &airpods(), &airpods()),
+            Rebuild::Required,
+            "a rebuild that exhausted its retries left no capture to keep"
+        );
     }
 
     fn attempt(outcomes: Vec<Result<(), i32>>) -> (Result<(), i32>, usize, Vec<Duration>) {

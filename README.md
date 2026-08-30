@@ -79,9 +79,10 @@ The sidecar:
 
 `device_changes` counts the rebuilds that succeeded, `failed_device_changes` the ones that exhausted
 their retries - a recording whose capture never came back says so. `silent` is the verdict of the
-silence check, which watches the opening seconds of the recording and of every rebuild, because a
-capture that turns into digital silence is otherwise invisible: callbacks keep firing, counters stay
-healthy, and the file is empty.
+silence check, which watches the opening seconds of the recording and restarts on every rebuild, so
+what it reports is the most recently judged opening - the recording's own, or the last rebuild's.
+The check exists because a capture that turns into digital silence is otherwise invisible: callbacks
+keep firing, counters stay healthy, and the file is empty.
 
 ## Configuration
 
@@ -107,6 +108,10 @@ mimi --check-config
 It exits non-zero and names the reason when the file cannot be used.
 
 ## Install
+
+mimi needs macOS 14.2 or newer: that is where the Core Audio process-tap API
+(`CATapDescription`, `AudioHardwareCreateProcessTap`) arrives. On anything older every session fails
+to create the tap.
 
 The binary needs a stable code signature so that TCC keeps recognising it across rebuilds:
 
@@ -150,11 +155,15 @@ look at first.
 
 ## Logs
 
-The LaunchAgent writes to `~/Library/Logs/mimi.log` and `~/Library/Logs/mimi.err.log`. mimi logs one
-event per session start, session end, device rebuild, rebuild failure, silence verdict and dropped
-ring blocks.
+Every event goes to stderr, so under the LaunchAgent the file to read is
+`~/Library/Logs/mimi.err.log`. `~/Library/Logs/mimi.log` is the agent's `StandardOutPath` and stays
+empty. mimi logs one event per session start, session end, device rebuild, rebuild failure, silence
+verdict and dropped ring blocks.
 
 ## Development
+
+A Rust toolchain of 1.85 or newer (the crate is edition 2024) and the Xcode command line tools have
+to be there already; `.mise.toml` carries the tasks, not a toolchain pin.
 
 ```sh
 mise run check   # cargo fmt --check, clippy -D warnings, cargo test

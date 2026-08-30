@@ -66,6 +66,14 @@ The rate is not a constant and must not be read once. It changes when the defaul
 and it changes when a device switches mode without changing identity: opening the microphone forces
 AirPods into headset mode, same UID, different rate.
 
+Two rates exist and they are not interchangeable. The rate the **writer** works from is the
+aggregate's, read after every build and published per generation through `Formats`. The rate the
+**rebuild decision** works from is the default *input* device's, sampled by `activity::poller` -
+there is no aggregate at poll time, and it is the input device that changes rate when AirPods enter
+headset mode. `rebuild_needed` therefore compares a poller sample against a poller sample: `Tap`'s
+baseline is the `Devices` its last successful build was handed, never `Tap::sample_rate()`. Seeding
+one side of that comparison from the aggregate makes it meaningless.
+
 ## `tapautostart` is 0
 
 `kAudioAggregateDeviceTapAutoStartKey` is a start gate, not a convenience. Measured twice: with the
@@ -95,7 +103,10 @@ failed attempt is retried (three attempts, 250 ms apart) rather than suppressed.
 session keeps its file and the sidecar records the failure.
 
 `devices::rebuild_needed` takes the rate as an input alongside the two device UIDs, because AirPods
-change rate without changing UID.
+change rate without changing UID. It also takes an `Io`, because a rebuild that exhausted its
+attempts leaves the baseline pointing at devices no capture is running on any more: without that
+input, devices that returned to what the session started on would be judged unchanged and the
+recording would stay silent for the rest of the meeting.
 
 ## Format generations, and why the writer resamples
 
@@ -111,6 +122,11 @@ fails too. So the client format is established by the first block and stands for
 file; a later generation captured at another rate is **resampled onto it** instead. The silence
 detector and the resampler both reset on a generation change, which is the rebuild boundary the
 writer can see.
+
+Two formats, not one. The **file** format is AAC at `config.sample_rate`, set once at creation - that
+is the rate the sidecar reports and the rate the file plays at. The **client** format is float PCM at
+the rate the aggregate delivered for the first block written, and `ExtAudioFile` converts between the
+two. Only the client format is bound to a generation.
 
 The `ExtAudioFileRef` is created, used and closed only on the writer thread. The rebuild path
 reaches the writer solely by pushing blocks with a new generation.

@@ -234,30 +234,21 @@ fn write_block(
     }
     *written = Some(*generation);
 
-    let conversion = conversion(*client, formats.rate(*generation));
-    match conversion {
-        Conversion::Unknown => return Ok(()),
-        Conversion::Establish(sample_rate) => {
-            file.set_client_format(sample_rate)?;
-            *client = Some(sample_rate);
-        }
-        Conversion::Direct => {}
-        Conversion::Resample { from: _, to: _ } => {}
-    }
-    let Some(client) = *client else {
-        return Ok(());
-    };
-
     fold(microphone, system, *frames, stereo);
-    let (samples, frames) = match conversion {
+    let (samples, frames, rate) = match conversion(*client, formats.rate(*generation)) {
         Conversion::Unknown => return Ok(()),
-        Conversion::Establish(_) | Conversion::Direct => (&*stereo, *frames),
+        Conversion::Establish(rate) => {
+            file.set_client_format(rate)?;
+            *client = Some(rate);
+            (&*stereo, *frames, rate)
+        }
+        Conversion::Direct(rate) => (&*stereo, *frames, rate),
         Conversion::Resample { from, to } => {
             let frames = resampler.resample(stereo, *frames, from, to, resampled);
-            (&*resampled, frames)
+            (&*resampled, frames, to)
         }
     };
-    silence.feed(samples, block_duration(frames, client));
+    silence.feed(samples, block_duration(frames, rate));
     file.write(samples, frames)
 }
 
@@ -272,7 +263,7 @@ fn block_duration(frames: usize, sample_rate: f64) -> Duration {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Conversion {
     Establish(f64),
-    Direct,
+    Direct(f64),
     Resample { from: f64, to: f64 },
     Unknown,
 }
@@ -286,10 +277,10 @@ fn conversion(client: Option<f64>, sample_rate: Option<f64>) -> Conversion {
         return Conversion::Establish(sample_rate);
     };
     let Some(sample_rate) = sample_rate else {
-        return Conversion::Direct;
+        return Conversion::Direct(client);
     };
     if sample_rate == client {
-        return Conversion::Direct;
+        return Conversion::Direct(client);
     }
     Conversion::Resample {
         from: sample_rate,
@@ -611,7 +602,7 @@ mod tests {
             let conversion = conversion(client, formats.rate(*generation));
             match conversion {
                 Conversion::Establish(sample_rate) => client = Some(sample_rate),
-                Conversion::Direct => {}
+                Conversion::Direct(_) => {}
                 Conversion::Resample { from: _, to: _ } => {}
                 Conversion::Unknown => {}
             }
@@ -694,9 +685,9 @@ mod tests {
             conversions(&[1, 1, 2, 2], &formats),
             vec![
                 Conversion::Establish(48_000.0),
-                Conversion::Direct,
-                Conversion::Direct,
-                Conversion::Direct,
+                Conversion::Direct(48_000.0),
+                Conversion::Direct(48_000.0),
+                Conversion::Direct(48_000.0),
             ]
         );
     }
@@ -714,7 +705,7 @@ mod tests {
                     from: 24_000.0,
                     to: 48_000.0
                 },
-                Conversion::Direct,
+                Conversion::Direct(48_000.0),
             ],
             "the open file keeps the rate its first block established"
         );
@@ -726,7 +717,7 @@ mod tests {
         assert_eq!(conversion(None, formats.rate(1)), Conversion::Unknown);
         assert_eq!(
             conversion(Some(48_000.0), formats.rate(2)),
-            Conversion::Direct
+            Conversion::Direct(48_000.0)
         );
     }
 

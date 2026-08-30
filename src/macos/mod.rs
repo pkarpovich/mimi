@@ -126,6 +126,8 @@ fn global_address(selector: AudioObjectPropertySelector) -> AudioObjectPropertyA
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use super::*;
 
     const UNKNOWN_SELECTOR: AudioObjectPropertySelector = 0x7a7a7a7a;
@@ -151,7 +153,13 @@ mod tests {
 
     #[test]
     fn the_user_id_is_the_one_the_process_runs_as() {
-        assert_eq!(user_id(), user_id(), "the uid does not change under us");
+        let reported = Command::new("id").arg("-u").output().expect("id -u");
+        let reported = String::from_utf8(reported.stdout).expect("a numeric uid");
+        assert_eq!(
+            user_id().to_string(),
+            reported.trim(),
+            "the launchd domain is built from this uid"
+        );
     }
 
     #[test]

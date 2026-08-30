@@ -56,6 +56,8 @@ pub enum ConfigError {
     TooLarge { field: &'static str, value: i64 },
     #[error("meeting_bundle_prefixes must not be empty")]
     NoBundlePrefixes,
+    #[error("meeting_bundle_prefixes must not carry a blank entry, which matches every process")]
+    BlankBundlePrefix,
     #[error("output_dir must not be empty")]
     EmptyOutputDir,
 }
@@ -114,6 +116,9 @@ fn from_toml(contents: &str, home: &Path) -> Result<Config, ConfigError> {
         Some(prefixes) => {
             let mut wrapped = Vec::with_capacity(prefixes.len());
             for prefix in prefixes {
+                if prefix.trim().is_empty() {
+                    return Err(ConfigError::BlankBundlePrefix);
+                }
                 wrapped.push(BundlePrefix::new(prefix));
             }
             wrapped
@@ -357,6 +362,7 @@ poll_interval_ms = 500
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
             | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
         }
     }
@@ -371,6 +377,7 @@ poll_interval_ms = 500
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
             | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
         }
     }
@@ -385,6 +392,7 @@ poll_interval_ms = 500
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
             | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
         }
     }
@@ -412,6 +420,7 @@ poll_interval_ms = 500
                 | ConfigError::Parse(_)
                 | ConfigError::TooLarge { .. }
                 | ConfigError::NoBundlePrefixes
+                | ConfigError::BlankBundlePrefix
                 | ConfigError::EmptyOutputDir => panic!("expected {field} to be rejected"),
             }
         }
@@ -430,6 +439,7 @@ poll_interval_ms = 500
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected an overflow error, got {error}"),
         }
     }
@@ -444,7 +454,30 @@ poll_interval_ms = 500
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected an empty-list error, got {error}"),
+        }
+    }
+
+    #[test]
+    fn a_blank_prefix_is_rejected_rather_than_matching_every_process() {
+        let home = Path::new("/Users/tester");
+        for contents in [
+            "meeting_bundle_prefixes = [\"\"]\n",
+            "meeting_bundle_prefixes = [\"us.zoom.\", \"  \"]\n",
+        ] {
+            let error = from_toml(contents, home).expect_err("a blank prefix matches everything");
+            match error {
+                ConfigError::BlankBundlePrefix => {}
+                ConfigError::Read { .. }
+                | ConfigError::Parse(_)
+                | ConfigError::NotPositive { .. }
+                | ConfigError::TooLarge { .. }
+                | ConfigError::NoBundlePrefixes
+                | ConfigError::EmptyOutputDir => {
+                    panic!("expected a blank-prefix error, got {error}")
+                }
+            }
         }
     }
 
@@ -458,7 +491,8 @@ poll_interval_ms = 500
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
-            | ConfigError::NoBundlePrefixes => panic!("expected an empty-dir error, got {error}"),
+            | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix => panic!("expected an empty-dir error, got {error}"),
         }
     }
 
@@ -474,6 +508,7 @@ poll_interval_ms = 500
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
             | ConfigError::NoBundlePrefixes
+            | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a read error, got {error}"),
         }
     }
