@@ -1,5 +1,6 @@
 mod layout;
 mod ring;
+mod silence;
 mod tap;
 
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,7 @@ const MAX_FORMATS: usize = 8;
 pub use ring::{
     Block, BlockRef, Consumer, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Drained, Producer, ring,
 };
+pub use silence::{OPENING_WINDOW, Silence, Verdict};
 pub use tap::Tap;
 
 /// TrackKind names the two tracks capture keeps apart until the writer folds them into one file.

@@ -25,7 +25,7 @@ use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
 use crate::capture::{Capture, CaptureConfig, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Tap};
 use crate::config::Config;
 use crate::session::{Decider, SessionCommand, SessionStart};
-use crate::writer::{Writer, WriterSettings};
+use crate::writer::{Finished, Writer, WriterSettings};
 
 const AGGREGATE_NAME: &str = "mimi";
 const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
@@ -158,12 +158,17 @@ fn run() -> ExitCode {
                 SessionCommand::Stop => {
                     capture.stop();
                     match recording.take() {
-                        Some(Recording { path, writer }) => match writer.finish() {
-                            Some(error) => {
-                                eprintln!("mimi: writing {} failed: {error}", path.display());
+                        Some(Recording { path, writer }) => {
+                            let Finished { error, verdict } = writer.finish();
+                            match error {
+                                Some(error) => {
+                                    eprintln!("mimi: writing {} failed: {error}", path.display());
+                                }
+                                None => {
+                                    println!("session stop: wrote {} ({verdict:?})", path.display())
+                                }
                             }
-                            None => println!("session stop: wrote {}", path.display()),
-                        },
+                        }
                         None => println!("session stop"),
                     }
                 }

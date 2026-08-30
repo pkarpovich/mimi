@@ -20,7 +20,7 @@ use objc2_core_audio_types::{
 use objc2_core_foundation::CFURL;
 use thiserror::Error;
 
-use crate::capture::{Block, Consumer, Drained, Formats};
+use crate::capture::{Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict};
 
 const CHANNELS: u32 = 2;
 const AAC_FRAMES_PER_PACKET: u32 = 1024;
@@ -81,24 +81,37 @@ impl Errors {
     }
 }
 
+/// Finished is what the writer thread leaves behind: the failure it hit and its silence verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finished {
+    pub error: Option<WriterError>,
+    pub verdict: Verdict,
+}
+
 /// Writer is the run loop's handle on the thread that owns the open file.
 pub struct Writer {
     stop: Sender<()>,
-    thread: JoinHandle<()>,
+    thread: JoinHandle<Verdict>,
     errors: Errors,
 }
 
 impl Writer {
-    /// finish stops the writer thread, waits for it, and reports what it failed on.
-    pub fn finish(self) -> Option<WriterError> {
+    /// finish stops the writer thread, waits for it, and reports what it failed on and heard.
+    pub fn finish(self) -> Finished {
         let Self {
             stop,
             thread,
             errors,
         } = self;
         drop(stop);
-        let _ = thread.join();
-        errors.take()
+        let verdict = match thread.join() {
+            Ok(verdict) => verdict,
+            Err(_) => Verdict::Undecided,
+        };
+        Finished {
+            error: errors.take(),
+            verdict,
+        }
     }
 }
 
@@ -127,7 +140,7 @@ fn run(
     formats: Formats,
     errors: Errors,
     stopping: Receiver<()>,
-) {
+) -> Verdict {
     let WriterSettings {
         path,
         sample_rate,
@@ -137,11 +150,12 @@ fn run(
         Ok(file) => file,
         Err(error) => {
             errors.set(error);
-            return;
+            return Verdict::Undecided;
         }
     };
 
     let mut applied = None;
+    let mut silence = Silence::new(OPENING_WINDOW);
     let mut stereo = Vec::with_capacity(2 * consumer.frames_per_block());
     loop {
         let stop = match stopping.try_recv() {
@@ -155,26 +169,42 @@ fn run(
             eprintln!("mimi: the writer fell behind and lost {dropped} blocks");
         }
         for block in blocks {
-            let Err(error) = write_block(&file, block, &formats, &mut applied, &mut stereo) else {
+            let written = write_block(
+                &file,
+                block,
+                &formats,
+                &mut applied,
+                &mut stereo,
+                &mut silence,
+            );
+            let Err(error) = written else {
                 continue;
             };
             errors.set(error);
-            return;
+            return silence.verdict();
         }
 
         match stop {
-            Stopping::Yes => return,
+            Stopping::Yes => return silence.verdict(),
             Stopping::No => thread::sleep(DRAIN_INTERVAL),
         }
     }
+}
+
+/// Applied is the client format the open file currently carries.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Applied {
+    generation: u64,
+    sample_rate: f64,
 }
 
 fn write_block(
     file: &AacFile,
     block: &Block,
     formats: &Formats,
-    applied: &mut Option<u64>,
+    applied: &mut Option<Applied>,
     stereo: &mut Vec<f32>,
+    silence: &mut Silence,
 ) -> Result<(), WriterError> {
     let Block {
         microphone,
@@ -183,16 +213,41 @@ fn write_block(
         host_time: _,
         generation,
     } = block;
-    match client_format(*applied, *generation, formats.rate(*generation)) {
+    let current = applied.map(
+        |Applied {
+             generation,
+             sample_rate: _,
+         }| generation,
+    );
+    match client_format(current, *generation, formats.rate(*generation)) {
         ClientFormat::Unknown => return Ok(()),
         ClientFormat::Keep => {}
         ClientFormat::Apply(sample_rate) => {
             file.set_client_format(sample_rate)?;
-            *applied = Some(*generation);
+            *applied = Some(Applied {
+                generation: *generation,
+                sample_rate,
+            });
+            silence.reset();
         }
     }
+    let Some(Applied {
+        generation: _,
+        sample_rate,
+    }) = *applied
+    else {
+        return Ok(());
+    };
     fold(microphone, system, *frames, stereo);
+    silence.feed(stereo, block_duration(*frames, sample_rate));
     file.write(stereo, *frames)
+}
+
+fn block_duration(frames: usize, sample_rate: f64) -> Duration {
+    if sample_rate <= 0.0 {
+        return Duration::ZERO;
+    }
+    Duration::from_secs_f64(frames as f64 / sample_rate)
 }
 
 /// ClientFormat is what a block needs done to the open file before it can be written.
@@ -606,13 +661,107 @@ mod tests {
             consumer,
             formats,
         );
-        assert_eq!(writer.finish(), None);
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(error, None);
+        assert_eq!(
+            verdict,
+            Verdict::AudioPresent,
+            "blocks carrying non-zero samples must not be reported as silence"
+        );
 
         let written = fs::metadata(file.path()).expect("the writer created the file");
         assert!(
             written.len() > 0,
             "a clean run must leave encoded audio behind"
         );
+    }
+
+    #[test]
+    fn a_run_of_all_zero_blocks_reports_silence() {
+        let file = TempFile::new();
+        let formats = Formats::new();
+        formats.publish(1, 24_000.0);
+
+        let (producer, consumer) = ring(64, 4096);
+        let zeros = vec![0.0; 4096];
+        for round in 0..18 {
+            producer.push(BlockRef {
+                microphone: &zeros,
+                system: &zeros,
+                frames: 4096,
+                host_time: round,
+                generation: 1,
+            });
+        }
+
+        let writer = spawn(
+            WriterSettings {
+                path: file.path().to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(error, None);
+        assert_eq!(verdict, Verdict::Silent);
+    }
+
+    #[test]
+    fn a_rebuild_restarts_the_silence_window_on_the_open_file() {
+        let file = TempFile::new();
+        let formats = Formats::new();
+        formats.publish(1, 24_000.0);
+        formats.publish(2, 24_000.0);
+
+        let (producer, consumer) = ring(64, 4096);
+        let zeros = vec![0.0; 4096];
+        for round in 0..18 {
+            producer.push(BlockRef {
+                microphone: &zeros,
+                system: &zeros,
+                frames: 4096,
+                host_time: round,
+                generation: 1,
+            });
+        }
+        let audible = vec![0.25; 4096];
+        producer.push(BlockRef {
+            microphone: &audible,
+            system: &zeros,
+            frames: 4096,
+            host_time: 18,
+            generation: 2,
+        });
+
+        let writer = spawn(
+            WriterSettings {
+                path: file.path().to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(error, None);
+        assert_eq!(
+            verdict,
+            Verdict::AudioPresent,
+            "the window a rebuild opened must judge the new capture, not the silent one before it"
+        );
+    }
+
+    #[test]
+    fn a_block_covers_its_frames_at_the_rate_it_was_captured() {
+        assert_eq!(block_duration(24_000, 24_000.0), Duration::from_secs(1));
+        assert_eq!(
+            block_duration(512, 48_000.0),
+            Duration::from_secs_f64(512.0 / 48_000.0)
+        );
+        assert_eq!(block_duration(512, 0.0), Duration::ZERO);
+        assert_eq!(block_duration(0, 24_000.0), Duration::ZERO);
     }
 
     #[test]
@@ -627,7 +776,9 @@ mod tests {
             consumer,
             Formats::new(),
         );
-        let error = writer.finish().expect("an unwritable path is reported");
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(verdict, Verdict::Undecided);
+        let error = error.expect("an unwritable path is reported");
         match error {
             WriterError::Create(status) => assert_ne!(status, 0),
             WriterError::Path(_)
