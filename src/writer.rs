@@ -46,6 +46,8 @@ pub enum WriterError {
     ConverterConfig(i32),
     #[error("writing to the audio file failed with status {0}")]
     Write(i32),
+    #[error("the writer thread ended before the file was complete")]
+    Panicked,
 }
 
 /// WriterSettings is the file a session writes and the encoder it is written through.
@@ -117,7 +119,10 @@ impl Writer {
         drop(stop);
         let verdict = match thread.join() {
             Ok(verdict) => verdict,
-            Err(_) => Verdict::Undecided,
+            Err(_) => {
+                errors.set(WriterError::Panicked);
+                Verdict::Undecided
+            }
         };
         Finished {
             error: errors.take(),
@@ -272,7 +277,7 @@ fn write_block(
 }
 
 fn block_duration(frames: usize, sample_rate: f64) -> Duration {
-    if sample_rate <= 0.0 {
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
         return Duration::ZERO;
     }
     Duration::from_secs_f64(frames as f64 / sample_rate)
@@ -1029,7 +1034,8 @@ mod tests {
             | WriterError::Converter(_)
             | WriterError::BitRate(_)
             | WriterError::ConverterConfig(_)
-            | WriterError::Write(_) => panic!("expected a create error, got {error}"),
+            | WriterError::Write(_)
+            | WriterError::Panicked => panic!("expected a create error, got {error}"),
         }
     }
 

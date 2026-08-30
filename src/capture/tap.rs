@@ -33,6 +33,8 @@ const AGGREGATE_IS_PRIVATE: i32 = 1;
 const TAP_AUTO_START: i32 = 0;
 const DRIFT_COMPENSATION_ON: i32 = 1;
 const MAX_BUFFERS: usize = 8;
+const RATE_READS: u32 = 24;
+const RATE_READ_INTERVAL: std::time::Duration = std::time::Duration::from_millis(25);
 
 /// Tap is the live capture: a global process tap inside a private aggregate device.
 pub struct Tap {
@@ -102,15 +104,7 @@ impl Tap {
         let aggregate = create_aggregate(&aggregate)?;
         self.aggregate = Some(aggregate);
 
-        let Some(sample_rate) =
-            macos::read_scalar::<f64>(aggregate, kAudioDevicePropertyNominalSampleRate)
-        else {
-            return Err(CaptureError::NoSampleRate);
-        };
-        self.sample_rate = Some(sample_rate);
-
         self.generation += 1;
-        self.formats.publish(self.generation, sample_rate);
         let io_proc = create_io_proc(aggregate, producer, self.generation)?;
         self.io_proc = io_proc;
 
@@ -118,6 +112,12 @@ impl Tap {
         if status != 0 {
             return Err(CaptureError::DeviceStart(status));
         }
+
+        let Some(sample_rate) = settled_rate(aggregate) else {
+            return Err(CaptureError::NoSampleRate);
+        };
+        self.sample_rate = Some(sample_rate);
+        self.formats.publish(self.generation, sample_rate);
         self.io = Io::Running;
         self.tracks = tracks(devices);
         Ok(())
@@ -284,6 +284,44 @@ fn presence<T>(value: Option<T>) -> Presence {
     }
 }
 
+/// Settle answers whether two consecutive readings of the delivered rate agree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Settle {
+    Settled(f64),
+    Changing(f64),
+}
+
+/// settle compares a reading with the one before it, so a rate still moving is not taken as final.
+pub fn settle(previous: Option<f64>, current: f64) -> Settle {
+    let Some(previous) = previous else {
+        return Settle::Changing(current);
+    };
+    if previous == current {
+        return Settle::Settled(current);
+    }
+    Settle::Changing(current)
+}
+
+fn settled_rate(aggregate: AudioObjectID) -> Option<f64> {
+    let mut previous = None;
+    for _ in 0..RATE_READS {
+        let Some(current) =
+            macos::read_scalar::<f64>(aggregate, kAudioDevicePropertyNominalSampleRate)
+        else {
+            return previous;
+        };
+        if !current.is_finite() || current <= 0.0 {
+            return previous;
+        }
+        match settle(previous, current) {
+            Settle::Settled(rate) => return Some(rate),
+            Settle::Changing(rate) => previous = Some(rate),
+        }
+        std::thread::sleep(RATE_READ_INTERVAL);
+    }
+    previous
+}
+
 fn tracks(devices: &Devices) -> Vec<TrackKind> {
     let Devices {
         input,
@@ -311,7 +349,11 @@ fn aggregate_description(
 
     let mut sub_devices = Vec::new();
     sub_devices.push(sub_device_entry(output, DriftCompensation::Off));
-    if let Some(input) = input {
+    // A composition that repeats one UID produces no microphone buffer at all, so a duplex device
+    // that is both the default input and the default output is listed once, as the main sub-device.
+    if let Some(input) = input
+        && input != output
+    {
         sub_devices.push(sub_device_entry(input, DriftCompensation::On));
     }
     let mut entries = Vec::with_capacity(sub_devices.len());
@@ -529,6 +571,26 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn a_first_reading_is_never_taken_as_settled() {
+        assert_eq!(settle(None, 48000.0), Settle::Changing(48000.0));
+    }
+
+    #[test]
+    fn two_equal_readings_settle_on_that_rate() {
+        assert_eq!(settle(Some(24000.0), 24000.0), Settle::Settled(24000.0));
+    }
+
+    #[test]
+    fn a_rate_still_moving_carries_the_newer_reading_forward() {
+        assert_eq!(settle(Some(48000.0), 24000.0), Settle::Changing(24000.0));
+    }
+
+    #[test]
+    fn a_rate_that_moves_back_is_still_unsettled() {
+        assert_eq!(settle(Some(24000.0), 48000.0), Settle::Changing(48000.0));
+    }
+
     fn description() -> CFRetained<CFDictionary<CFString, CFType>> {
         aggregate_description(
             &CaptureConfig::new("mimi", "dev.pkarpovich.mimi.aggregate"),
@@ -680,6 +742,28 @@ mod tests {
             string(&entry(&entries[0]), kAudioSubDeviceUIDKey),
             Some("BuiltInSpeakerDevice".to_string())
         );
+    }
+
+    #[test]
+    fn a_device_that_is_both_default_input_and_default_output_is_listed_once() {
+        let description = aggregate_description(
+            &CaptureConfig::new("mimi", "dev.pkarpovich.mimi.aggregate"),
+            &DeviceUid::new("RODE-NT-USB-Plus"),
+            Some(&DeviceUid::new("RODE-NT-USB-Plus")),
+            "6E1F0A2C-0000-4000-8000-0123456789AB",
+        );
+        let entries = array(&description, kAudioAggregateDeviceSubDeviceListKey);
+        assert_eq!(
+            entries.len(),
+            1,
+            "a repeated UID yields a composition with no microphone buffer at all"
+        );
+        let entry = entry(&entries[0]);
+        assert_eq!(
+            string(&entry, kAudioSubDeviceUIDKey),
+            Some("RODE-NT-USB-Plus".to_string())
+        );
+        assert_eq!(number(&entry, kAudioSubDeviceDriftCompensationKey), None);
     }
 
     #[test]

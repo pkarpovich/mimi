@@ -109,7 +109,11 @@ fn default_device_uid(selector: AudioObjectPropertySelector) -> Option<DeviceUid
 
 fn default_input_rate() -> Option<f64> {
     let device = default_device(kAudioHardwarePropertyDefaultInputDevice)?;
-    macos::read_scalar::<f64>(device, kAudioDevicePropertyNominalSampleRate)
+    let rate = macos::read_scalar::<f64>(device, kAudioDevicePropertyNominalSampleRate)?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    Some(rate)
 }
 
 fn default_device(selector: AudioObjectPropertySelector) -> Option<AudioObjectID> {
