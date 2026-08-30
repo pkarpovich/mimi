@@ -20,6 +20,7 @@ use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
+use super::layout::{self, Buffer, Tracks};
 use super::{BlockRef, Capture, CaptureConfig, CaptureError, Producer, TrackKind};
 use crate::activity::{DeviceUid, Devices};
 use crate::macos;
@@ -27,6 +28,7 @@ use crate::macos;
 const AGGREGATE_IS_PRIVATE: i32 = 1;
 const TAP_AUTO_START: i32 = 0;
 const DRIFT_COMPENSATION_ON: i32 = 1;
+const MAX_BUFFERS: usize = 8;
 
 /// Tap is the live capture: a global process tap inside a private aggregate device.
 pub struct Tap {
@@ -384,21 +386,21 @@ fn create_io_proc(
     producer: Producer,
     generation: u64,
 ) -> Result<AudioDeviceIOProcID, CaptureError> {
-    let scratch = RefCell::new(Vec::<f32>::with_capacity(producer.frames_per_block()));
+    let scratch = RefCell::new(Tracks::new(producer.frames_per_block()));
     let block = RcBlock::new(
         move |_now: NonNull<AudioTimeStamp>,
               input: NonNull<AudioBufferList>,
               input_time: NonNull<AudioTimeStamp>,
               _output: NonNull<AudioBufferList>,
               _output_time: NonNull<AudioTimeStamp>| {
-            let Ok(mut system) = scratch.try_borrow_mut() else {
+            let Ok(mut tracks) = scratch.try_borrow_mut() else {
                 return;
             };
-            let frames = unsafe { copy_system_track(input, &mut system) };
+            let frames = unsafe { interpret_buffer_list(input, &mut tracks) };
             let host_time = unsafe { input_time.as_ref() }.mHostTime;
             producer.push(BlockRef {
-                microphone: &[],
-                system: system.as_slice(),
+                microphone: tracks.microphone(),
+                system: tracks.system(),
                 frames,
                 host_time,
                 generation,
@@ -423,33 +425,34 @@ fn create_io_proc(
     Ok(io_proc)
 }
 
-unsafe fn copy_system_track(input: NonNull<AudioBufferList>, samples: &mut Vec<f32>) -> usize {
-    samples.clear();
+unsafe fn interpret_buffer_list(input: NonNull<AudioBufferList>, tracks: &mut Tracks) -> usize {
     let list = unsafe { input.as_ref() };
-    let count = list.mNumberBuffers as usize;
+    let count = (list.mNumberBuffers as usize).min(MAX_BUFFERS);
     if count == 0 {
-        return 0;
+        return layout::interpret(&[], tracks);
     }
     let buffers = unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), count) };
-    let AudioBuffer {
-        mNumberChannels: channels,
-        mDataByteSize: bytes,
-        mData: data,
-    } = buffers[count - 1];
-    let channels = channels as usize;
-    if channels == 0 {
-        return 0;
+    let mut views = [Buffer::NONE; MAX_BUFFERS];
+    for (index, buffer) in buffers.iter().enumerate() {
+        let AudioBuffer {
+            mNumberChannels: channels,
+            mDataByteSize: bytes,
+            mData: data,
+        } = *buffer;
+        let channels = channels as usize;
+        if channels == 0 {
+            continue;
+        }
+        let Some(data) = NonNull::new(data.cast::<f32>()) else {
+            continue;
+        };
+        let samples = bytes as usize / size_of::<f32>();
+        views[index] = Buffer {
+            channels,
+            samples: unsafe { std::slice::from_raw_parts(data.as_ptr(), samples) },
+        };
     }
-    let Some(data) = NonNull::new(data.cast::<f32>()) else {
-        return 0;
-    };
-    let frames = bytes as usize / size_of::<f32>() / channels;
-    let frames = frames.min(samples.capacity());
-    let data = unsafe { std::slice::from_raw_parts(data.as_ptr(), frames * channels) };
-    for frame in 0..frames {
-        samples.push(data[frame * channels]);
-    }
-    frames
+    layout::interpret(&views[..count], tracks)
 }
 
 fn stop_device(device: Option<AudioObjectID>, io_proc: AudioDeviceIOProcID) {
