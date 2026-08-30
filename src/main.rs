@@ -6,17 +6,19 @@ mod plist;
 mod activity;
 mod config;
 mod macos;
+mod session;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use argh::FromArgs;
 
 use crate::activity::poller::{self, CoreAudio};
 use crate::activity::{ActivityEvent, AudioProcess};
+use crate::session::{Decider, SessionCommand, SessionStart};
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -108,11 +110,21 @@ fn run() -> ExitCode {
     };
 
     let interval = Duration::from_millis(config.poll_interval_ms.into());
+    let grace = Duration::from_secs(config.stop_grace_seconds.into());
+    let mut decider = Decider::new(config.meeting_bundle_prefixes, grace);
     let (events, incoming) = mpsc::channel();
     let (_stop, stopped) = mpsc::channel();
     thread::spawn(move || poller::poll(&CoreAudio::live(), interval, stopped, events));
 
     for event in incoming {
+        for command in decider.observe(&event, Instant::now()) {
+            match command {
+                SessionCommand::Start(SessionStart { bundle_id, label }) => {
+                    println!("session start: {label} ({})", bundle_id.as_str());
+                }
+                SessionCommand::Stop => println!("session stop"),
+            }
+        }
         match event {
             ActivityEvent::InputTaken(process) => println!("input taken by {}", describe(&process)),
             ActivityEvent::InputReleased(process) => {
