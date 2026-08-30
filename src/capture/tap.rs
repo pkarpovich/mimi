@@ -21,7 +21,7 @@ use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFStrin
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
 use super::layout::{self, Buffer, Tracks};
-use super::{BlockRef, Capture, CaptureConfig, CaptureError, Producer, TrackKind};
+use super::{BlockRef, Capture, CaptureConfig, CaptureError, Formats, Producer, TrackKind};
 use crate::activity::{DeviceUid, Devices};
 use crate::macos;
 
@@ -41,6 +41,7 @@ pub struct Tap {
     sample_rate: Option<f64>,
     tracks: Vec<TrackKind>,
     generation: u64,
+    formats: Formats,
 }
 
 impl Tap {
@@ -55,6 +56,7 @@ impl Tap {
             sample_rate: None,
             tracks: Vec::new(),
             generation: 0,
+            formats: Formats::new(),
         }
     }
 
@@ -100,6 +102,7 @@ impl Tap {
         self.sample_rate = Some(sample_rate);
 
         self.generation += 1;
+        self.formats.publish(self.generation, sample_rate);
         let io_proc = create_io_proc(aggregate, producer, self.generation)?;
         self.io_proc = io_proc;
 
@@ -165,6 +168,10 @@ impl Capture for Tap {
 
     fn tracks(&self) -> &[TrackKind] {
         &self.tracks
+    }
+
+    fn formats(&self) -> Formats {
+        self.formats.clone()
     }
 }
 
@@ -737,6 +744,11 @@ mod tests {
         );
         assert_eq!(capture.sample_rate(), None);
         assert_eq!(capture.tracks(), &[]);
+        assert_eq!(
+            capture.formats().rate(1),
+            None,
+            "a build that never read a rate must not publish one for the writer"
+        );
     }
 
     #[test]

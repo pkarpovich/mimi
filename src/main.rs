@@ -8,21 +8,24 @@ mod capture;
 mod config;
 mod macos;
 mod session;
+mod writer;
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use argh::FromArgs;
+use chrono::Local;
 
 use crate::activity::poller::{self, CoreAudio};
 use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
-use crate::capture::{
-    Capture, CaptureConfig, Consumer, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Drained, Tap,
-};
+use crate::capture::{Capture, CaptureConfig, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Tap};
+use crate::config::Config;
 use crate::session::{Decider, SessionCommand, SessionStart};
+use crate::writer::{Writer, WriterSettings};
 
 const AGGREGATE_NAME: &str = "mimi";
 const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
@@ -116,9 +119,18 @@ fn run() -> ExitCode {
         }
     };
 
-    let interval = Duration::from_millis(config.poll_interval_ms.into());
-    let grace = Duration::from_secs(config.stop_grace_seconds.into());
-    let mut decider = Decider::new(config.meeting_bundle_prefixes, grace);
+    let Config {
+        output_dir,
+        meeting_bundle_prefixes,
+        sample_rate,
+        bit_rate,
+        stop_grace_seconds,
+        poll_interval_ms,
+    } = config;
+
+    let interval = Duration::from_millis(poll_interval_ms.into());
+    let grace = Duration::from_secs(stop_grace_seconds.into());
+    let mut decider = Decider::new(meeting_bundle_prefixes, grace);
     let sampler = CoreAudio::live();
     let mut devices = sampler.devices();
     let mut capture = Tap::new(CaptureConfig::new(AGGREGATE_NAME, AGGREGATE_UID));
@@ -132,28 +144,30 @@ fn run() -> ExitCode {
             match command {
                 SessionCommand::Start(SessionStart { bundle_id, label }) => {
                     println!("session start: {label} ({})", bundle_id.as_str());
-                    recording = start_capture(&mut capture, &devices);
+                    recording = start_recording(
+                        &mut capture,
+                        &devices,
+                        &Output {
+                            dir: &output_dir,
+                            label: &label,
+                            sample_rate,
+                            bit_rate,
+                        },
+                    );
                 }
                 SessionCommand::Stop => {
                     capture.stop();
-                    match &mut recording {
-                        Some(recording) => {
-                            drain(recording);
-                            let Recording {
-                                consumer: _,
-                                blocks,
-                                dropped,
-                            } = recording;
-                            println!("session stop: {blocks} blocks, {dropped} dropped");
-                        }
+                    match recording.take() {
+                        Some(Recording { path, writer }) => match writer.finish() {
+                            Some(error) => {
+                                eprintln!("mimi: writing {} failed: {error}", path.display());
+                            }
+                            None => println!("session stop: wrote {}", path.display()),
+                        },
                         None => println!("session stop"),
                     }
-                    recording = None;
                 }
             }
-        }
-        if let Some(recording) = &mut recording {
-            drain(recording);
         }
 
         match event {
@@ -176,12 +190,33 @@ fn run() -> ExitCode {
 }
 
 struct Recording {
-    consumer: Consumer,
-    blocks: u64,
-    dropped: u64,
+    path: PathBuf,
+    writer: Writer,
 }
 
-fn start_capture(capture: &mut Tap, devices: &Devices) -> Option<Recording> {
+struct Output<'a> {
+    dir: &'a Path,
+    label: &'a str,
+    sample_rate: u32,
+    bit_rate: u32,
+}
+
+fn start_recording(capture: &mut Tap, devices: &Devices, output: &Output<'_>) -> Option<Recording> {
+    let Output {
+        dir,
+        label,
+        sample_rate,
+        bit_rate,
+    } = output;
+    if let Err(error) = fs::create_dir_all(dir) {
+        eprintln!("mimi: {} is not usable: {error}", dir.display());
+        return None;
+    }
+    let path = dir.join(format!(
+        "{}-{label}.aac.partial",
+        Local::now().format("%Y-%m-%dT%H-%M-%S")
+    ));
+
     let (producer, consumer) = capture::ring(DEFAULT_SLOTS, DEFAULT_FRAMES_PER_BLOCK);
     let Err(error) = capture.start(devices, producer) else {
         println!(
@@ -189,28 +224,19 @@ fn start_capture(capture: &mut Tap, devices: &Devices) -> Option<Recording> {
             capture.sample_rate(),
             capture.tracks()
         );
-        return Some(Recording {
+        let writer = writer::spawn(
+            WriterSettings {
+                path: path.clone(),
+                sample_rate: *sample_rate,
+                bit_rate: *bit_rate,
+            },
             consumer,
-            blocks: 0,
-            dropped: 0,
-        });
+            capture.formats(),
+        );
+        return Some(Recording { path, writer });
     };
     eprintln!("mimi: capture did not start: {error}");
     None
-}
-
-fn drain(recording: &mut Recording) {
-    let Recording {
-        consumer,
-        blocks,
-        dropped,
-    } = recording;
-    let Drained {
-        blocks: drained,
-        dropped: missed,
-    } = consumer.drain();
-    *blocks += drained.len() as u64;
-    *dropped += missed;
 }
 
 fn rebuild_capture(capture: &mut Tap, devices: &Devices) {

@@ -120,6 +120,10 @@ pub struct Consumer {
 }
 
 impl Consumer {
+    pub fn frames_per_block(&self) -> usize {
+        self.shared.frames_per_block
+    }
+
     pub fn drain(&mut self) -> Drained<'_> {
         let write = self.shared.write.load(Ordering::Acquire);
         let read = self.shared.read.load(Ordering::Relaxed);
@@ -335,8 +339,9 @@ mod tests {
 
     #[test]
     fn the_producer_reports_the_slot_capacity_the_io_proc_must_stay_within() {
-        let (producer, _consumer) = ring(4, 512);
+        let (producer, consumer) = ring(4, 512);
         assert_eq!(producer.frames_per_block(), 512);
+        assert_eq!(consumer.frames_per_block(), 512);
     }
 
     #[test]

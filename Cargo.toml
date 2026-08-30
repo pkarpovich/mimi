@@ -10,7 +10,7 @@ chrono = "0.4.45"
 dispatch2 = "0.3.1"
 libc = "0.2.189"
 objc2 = "0.6.4"
-objc2-audio-toolbox = { version = "0.3.2", features = ["ExtendedAudioFile"] }
+objc2-audio-toolbox = { version = "0.3.2", features = ["ExtendedAudioFile", "AudioFile", "AudioConverter", "objc2-core-audio-types", "objc2-core-foundation"] }
 objc2-core-audio = { version = "0.3.2", features = ["AudioHardware", "objc2", "objc2-foundation", "objc2-core-audio-types", "block2", "dispatch2"] }
 objc2-core-audio-types = "0.3.2"
 objc2-core-foundation = "0.3.2"
