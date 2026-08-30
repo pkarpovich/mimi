@@ -19,6 +19,7 @@ use objc2_core_audio_types::{
 };
 use objc2_core_foundation::CFURL;
 use thiserror::Error;
+use tracing::warn;
 
 use crate::capture::{Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict};
 
@@ -166,7 +167,7 @@ fn run(
 
         let Drained { blocks, dropped } = consumer.drain();
         if dropped > 0 {
-            eprintln!("mimi: the writer fell behind and lost {dropped} blocks");
+            warn!("the writer fell behind and lost {dropped} blocks");
         }
         for block in blocks {
             let written = write_block(&file, block, &formats, &mut encoding, &mut silence);
