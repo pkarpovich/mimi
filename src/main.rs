@@ -21,7 +21,7 @@ use std::time::Duration;
 use argh::FromArgs;
 use tracing::Level;
 
-use crate::activity::DeviceSource;
+use crate::activity::Devices;
 use crate::activity::poller::{self, CoreAudio};
 use crate::capture::{CaptureConfig, Tap};
 use crate::config::Config;
@@ -141,7 +141,11 @@ fn run() -> ExitCode {
     }
 
     let interval = Duration::from_millis(poll_interval_ms.into());
-    let devices = CoreAudio::live().devices();
+    let devices = Devices {
+        input: None,
+        output: None,
+        sample_rate: None,
+    };
     let mut capture = Tap::new(CaptureConfig::new(AGGREGATE_NAME, AGGREGATE_UID));
     let (events, incoming) = mpsc::channel();
     let (stop, stopped) = mpsc::channel();

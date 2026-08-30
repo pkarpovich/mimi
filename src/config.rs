@@ -12,6 +12,14 @@ const DEFAULT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_BIT_RATE: u32 = 96_000;
 const DEFAULT_STOP_GRACE_SECONDS: u32 = 15;
 const DEFAULT_POLL_INTERVAL_MS: u32 = 1_000;
+const AAC_SAMPLE_RATES: [u32; 12] = [
+    8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000,
+];
+const AAC_SAMPLE_RATES_TEXT: &str =
+    "one of 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000";
+const MIN_BIT_RATE: u32 = 8_000;
+const MAX_BIT_RATE: u32 = 320_000;
+const BIT_RATE_TEXT: &str = "between 8000 and 320000 bits per second";
 const DEFAULT_BUNDLE_PREFIXES: [&str; 5] = [
     "company.thebrowser.",
     "us.zoom.",
@@ -54,6 +62,12 @@ pub enum ConfigError {
     NotPositive { field: &'static str, value: i64 },
     #[error("{field} is too large, got {value}")]
     TooLarge { field: &'static str, value: i64 },
+    #[error("{field} must be {allowed}, got {value}")]
+    Unsupported {
+        field: &'static str,
+        allowed: &'static str,
+        value: u32,
+    },
     #[error("meeting_bundle_prefixes must not be empty")]
     NoBundlePrefixes,
     #[error("meeting_bundle_prefixes must not carry a blank entry, which matches every process")]
@@ -132,8 +146,8 @@ fn from_toml(contents: &str, home: &Path) -> Result<Config, ConfigError> {
     Ok(Config {
         output_dir,
         meeting_bundle_prefixes,
-        sample_rate: positive("sample_rate", sample_rate, DEFAULT_SAMPLE_RATE)?,
-        bit_rate: positive("bit_rate", bit_rate, DEFAULT_BIT_RATE)?,
+        sample_rate: encoder_rate(positive("sample_rate", sample_rate, DEFAULT_SAMPLE_RATE)?)?,
+        bit_rate: encoder_bit_rate(positive("bit_rate", bit_rate, DEFAULT_BIT_RATE)?)?,
         stop_grace_seconds: positive(
             "stop_grace_seconds",
             stop_grace_seconds,
@@ -165,6 +179,36 @@ fn positive(field: &'static str, value: Option<i64>, default: u32) -> Result<u32
     let Ok(value) = u32::try_from(value) else {
         return Err(ConfigError::TooLarge { field, value });
     };
+    Ok(value)
+}
+
+/// encoder_rate refuses a rate AAC cannot carry, which the writer would only discover mid-meeting.
+fn encoder_rate(value: u32) -> Result<u32, ConfigError> {
+    let mut supported = false;
+    for rate in AAC_SAMPLE_RATES {
+        if rate == value {
+            supported = true;
+            break;
+        }
+    }
+    if !supported {
+        return Err(ConfigError::Unsupported {
+            field: "sample_rate",
+            allowed: AAC_SAMPLE_RATES_TEXT,
+            value,
+        });
+    }
+    Ok(value)
+}
+
+fn encoder_bit_rate(value: u32) -> Result<u32, ConfigError> {
+    if !(MIN_BIT_RATE..=MAX_BIT_RATE).contains(&value) {
+        return Err(ConfigError::Unsupported {
+            field: "bit_rate",
+            allowed: BIT_RATE_TEXT,
+            value,
+        });
+    }
     Ok(value)
 }
 
@@ -361,6 +405,7 @@ poll_interval_ms = 500
             ConfigError::Read { .. }
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
@@ -376,6 +421,7 @@ poll_interval_ms = 500
             ConfigError::Read { .. }
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
@@ -391,6 +437,7 @@ poll_interval_ms = 500
             ConfigError::Read { .. }
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
@@ -419,6 +466,7 @@ poll_interval_ms = 500
                 ConfigError::Read { .. }
                 | ConfigError::Parse(_)
                 | ConfigError::TooLarge { .. }
+                | ConfigError::Unsupported { .. }
                 | ConfigError::NoBundlePrefixes
                 | ConfigError::BlankBundlePrefix
                 | ConfigError::EmptyOutputDir => panic!("expected {field} to be rejected"),
@@ -438,9 +486,64 @@ poll_interval_ms = 500
             ConfigError::Read { .. }
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected an overflow error, got {error}"),
+        }
+    }
+
+    #[test]
+    fn a_rate_the_encoder_cannot_carry_is_rejected_before_the_first_meeting() {
+        let home = Path::new("/Users/tester");
+        for contents in ["sample_rate = 1\n", "sample_rate = 44000\n"] {
+            let error = from_toml(contents, home).expect_err(contents);
+            match error {
+                ConfigError::Unsupported {
+                    field,
+                    allowed: _,
+                    value: _,
+                } => assert_eq!(field, "sample_rate"),
+                ConfigError::Read { .. }
+                | ConfigError::Parse(_)
+                | ConfigError::NotPositive { .. }
+                | ConfigError::TooLarge { .. }
+                | ConfigError::NoBundlePrefixes
+                | ConfigError::BlankBundlePrefix
+                | ConfigError::EmptyOutputDir => panic!("expected {contents} to be rejected"),
+            }
+        }
+    }
+
+    #[test]
+    fn every_aac_rate_is_accepted() {
+        let home = Path::new("/Users/tester");
+        for rate in AAC_SAMPLE_RATES {
+            let config =
+                from_toml(&format!("sample_rate = {rate}\n"), home).expect("a supported rate");
+            assert_eq!(config.sample_rate, rate);
+        }
+    }
+
+    #[test]
+    fn a_bit_rate_outside_the_encoder_range_is_rejected() {
+        let home = Path::new("/Users/tester");
+        for contents in ["bit_rate = 96\n", "bit_rate = 1000000\n"] {
+            let error = from_toml(contents, home).expect_err(contents);
+            match error {
+                ConfigError::Unsupported {
+                    field,
+                    allowed: _,
+                    value: _,
+                } => assert_eq!(field, "bit_rate"),
+                ConfigError::Read { .. }
+                | ConfigError::Parse(_)
+                | ConfigError::NotPositive { .. }
+                | ConfigError::TooLarge { .. }
+                | ConfigError::NoBundlePrefixes
+                | ConfigError::BlankBundlePrefix
+                | ConfigError::EmptyOutputDir => panic!("expected {contents} to be rejected"),
+            }
         }
     }
 
@@ -454,6 +557,7 @@ poll_interval_ms = 500
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected an empty-list error, got {error}"),
         }
@@ -473,6 +577,7 @@ poll_interval_ms = 500
                 | ConfigError::Parse(_)
                 | ConfigError::NotPositive { .. }
                 | ConfigError::TooLarge { .. }
+                | ConfigError::Unsupported { .. }
                 | ConfigError::NoBundlePrefixes
                 | ConfigError::EmptyOutputDir => {
                     panic!("expected a blank-prefix error, got {error}")
@@ -491,6 +596,7 @@ poll_interval_ms = 500
             | ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix => panic!("expected an empty-dir error, got {error}"),
         }
@@ -507,6 +613,7 @@ poll_interval_ms = 500
             ConfigError::Parse(_)
             | ConfigError::NotPositive { .. }
             | ConfigError::TooLarge { .. }
+            | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
             | ConfigError::EmptyOutputDir => panic!("expected a read error, got {error}"),

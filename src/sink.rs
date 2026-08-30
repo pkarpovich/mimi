@@ -1,5 +1,8 @@
 use std::fs;
+use std::fs::OpenOptions;
 use std::io;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Local, SecondsFormat};
@@ -13,6 +16,12 @@ use crate::writer::Written;
 const AUDIO_EXTENSION: &str = "aac";
 const PARTIAL_EXTENSION: &str = "partial";
 const SIDECAR_EXTENSION: &str = "json";
+
+/// RECORDING_MODE keeps a meeting readable by the user who recorded it and nobody else.
+pub const RECORDING_MODE: u32 = 0o600;
+
+/// RECORDINGS_DIR_MODE is the mode `output_dir` is created with when it does not exist yet.
+pub const RECORDINGS_DIR_MODE: u32 = 0o700;
 
 /// Recording is the finished session a sink accepts, with every field its sidecar carries.
 #[derive(Debug, Clone, PartialEq)]
@@ -88,7 +97,7 @@ impl Sink for LocalFolder {
             }
         };
         let completed = completed.with_extension(SIDECAR_EXTENSION);
-        if let Err(source) = fs::write(&completed, described) {
+        if let Err(source) = write_private(&completed, &described) {
             return Err(SinkError::Sidecar {
                 path: completed,
                 source,
@@ -156,26 +165,55 @@ pub fn file_stem(started_at: DateTime<Local>, label: &str) -> String {
     format!("{}-{label}", started_at.format("%Y-%m-%dT%H-%M-%S"))
 }
 
-/// unused_stem answers with the first stem in `dir` that no other recording has taken.
-pub fn unused_stem(dir: &Path, stem: String) -> String {
+/// reserve creates the in-progress file for the first stem in `dir` no other recording has taken.
+pub fn reserve(dir: &Path, stem: String) -> Result<PathBuf, io::Error> {
     let mut candidate = stem.clone();
     let mut suffix: u32 = 2;
-    while taken(dir, &candidate) {
+    loop {
+        // The name is claimed by creating the file, never by looking first: a second recorder
+        // walking the same stems in the same second must not be handed a name this one is about to
+        // write. The completed siblings are then checked *after* the claim exists, because a
+        // recorder that finished in the meantime renamed its own `.partial` away - looking before
+        // the claim leaves a window where this reservation lands on a finished recording and the
+        // rename at the end of the session overwrites it.
+        let path = partial_path(dir, &candidate);
+        let created = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(RECORDING_MODE)
+            .open(&path);
+        match created {
+            Ok(_) => {
+                if !finished(dir, &candidate) {
+                    return Ok(path);
+                }
+                let _ = fs::remove_file(&path);
+            }
+            Err(failure) if failure.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(failure) => return Err(failure),
+        }
         candidate = format!("{stem}-{suffix}");
         suffix += 1;
     }
-    candidate
 }
 
-/// partial_path is where a session writes while it is still recording.
-pub fn partial_path(dir: &Path, stem: &str) -> PathBuf {
+fn partial_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.{AUDIO_EXTENSION}.{PARTIAL_EXTENSION}"))
 }
 
-fn taken(dir: &Path, stem: &str) -> bool {
+fn write_private(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(RECORDING_MODE)
+        .open(path)?;
+    file.write_all(contents)
+}
+
+fn finished(dir: &Path, stem: &str) -> bool {
     let names = [
         format!("{stem}.{AUDIO_EXTENSION}"),
-        format!("{stem}.{AUDIO_EXTENSION}.{PARTIAL_EXTENSION}"),
         format!("{stem}.{SIDECAR_EXTENSION}"),
     ];
     let mut found = false;
@@ -199,6 +237,7 @@ fn completed_path(partial: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     use chrono::TimeZone;
@@ -266,10 +305,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unused_stem_is_returned_unchanged() {
+    fn an_unused_stem_reserves_the_file_it_was_asked_for() {
         let dir = TempDir::new();
         let stem = file_stem(started_at(), "zoom");
-        assert_eq!(unused_stem(dir.path(), stem.clone()), stem);
+        let reserved = reserve(dir.path(), stem.clone()).expect("reserve the stem");
+        assert_eq!(reserved, partial_path(dir.path(), &stem));
+        assert!(
+            reserved.exists(),
+            "the reservation is on disk, not just a name"
+        );
     }
 
     #[test]
@@ -277,13 +321,67 @@ mod tests {
         let dir = TempDir::new();
         let stem = file_stem(started_at(), "zoom");
         dir.touch(&format!("{stem}.aac"));
-        assert_eq!(unused_stem(dir.path(), stem.clone()), format!("{stem}-2"));
+        assert_eq!(
+            reserve(dir.path(), stem.clone()).expect("suffix past the audio file"),
+            partial_path(dir.path(), &format!("{stem}-2"))
+        );
 
-        dir.touch(&format!("{stem}-2.json"));
-        assert_eq!(unused_stem(dir.path(), stem.clone()), format!("{stem}-3"));
+        dir.touch(&format!("{stem}-3.json"));
+        assert_eq!(
+            reserve(dir.path(), stem.clone()).expect("suffix past the sidecar"),
+            partial_path(dir.path(), &format!("{stem}-4"))
+        );
+    }
 
-        dir.touch(&format!("{stem}-3.aac.partial"));
-        assert_eq!(unused_stem(dir.path(), stem.clone()), format!("{stem}-4"));
+    #[test]
+    fn a_completed_recording_survives_the_walk_past_its_stem() {
+        let dir = TempDir::new();
+        let stem = file_stem(started_at(), "zoom");
+        dir.touch(&format!("{stem}.aac"));
+        dir.touch(&format!("{stem}.json"));
+
+        let reserved = reserve(dir.path(), stem.clone()).expect("reserve past the completed pair");
+
+        assert_eq!(reserved, partial_path(dir.path(), &format!("{stem}-2")));
+        assert_eq!(
+            fs::read(dir.path().join(format!("{stem}.aac"))).expect("the completed file"),
+            b"x",
+            "claiming a stem to test it must leave a finished recording untouched"
+        );
+        assert!(
+            !partial_path(dir.path(), &stem).exists(),
+            "the claim that landed on a finished recording is given back"
+        );
+    }
+
+    #[test]
+    fn a_reservation_is_not_handed_out_twice() {
+        let dir = TempDir::new();
+        let stem = file_stem(started_at(), "zoom");
+        let first = reserve(dir.path(), stem.clone()).expect("the first reservation");
+        let second = reserve(dir.path(), stem.clone()).expect("the second reservation");
+        assert_eq!(first, partial_path(dir.path(), &stem));
+        assert_eq!(
+            second,
+            partial_path(dir.path(), &format!("{stem}-2")),
+            "a stem another recorder is already writing is taken"
+        );
+    }
+
+    #[test]
+    fn a_reserved_recording_is_readable_only_by_its_owner() {
+        let dir = TempDir::new();
+        let reserved =
+            reserve(dir.path(), file_stem(started_at(), "zoom")).expect("reserve the stem");
+        let mode = fs::metadata(&reserved)
+            .expect("the reserved file")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a meeting must not be readable by group or other"
+        );
     }
 
     #[test]
@@ -357,12 +455,22 @@ mod tests {
         let completed = dir.path().join(format!("{stem}.aac"));
         assert_eq!(fs::read(&completed).expect("the completed file"), b"adts");
 
-        let described = fs::read_to_string(dir.path().join(format!("{stem}.json")))
-            .expect("the sidecar beside it");
+        let sidecar = dir.path().join(format!("{stem}.json"));
+        let described = fs::read_to_string(&sidecar).expect("the sidecar beside it");
         let described: serde_json::Value =
             serde_json::from_str(&described).expect("valid sidecar json");
         assert_eq!(described["duration_seconds"], 1830);
         assert_eq!(described["device_changes"], 1);
+
+        let mode = fs::metadata(&sidecar)
+            .expect("the sidecar")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a sidecar names the meeting application and must not be readable by group or other"
+        );
     }
 
     #[test]

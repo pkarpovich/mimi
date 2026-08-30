@@ -59,7 +59,13 @@ Everything goes into `output_dir` (default `~/Recordings/mimi`). For a session t
 The label comes from the allow-list prefix that matched: lowercased, trailing dot removed, reduced
 to its last dotted component. `company.thebrowser.` becomes `thebrowser`, `us.zoom.` becomes `zoom`,
 `com.google.Chrome` becomes `chrome`. A name that is already taken gets a numeric suffix rather than
-overwriting anything.
+overwriting anything: the in-progress file is created at the moment the name is chosen, so a second
+recorder walking the same names in the same second is handed the next suffix rather than the file
+this one is about to write.
+
+`output_dir` is created `0700` when it does not exist, and recordings and sidecars are created
+`0600` - a meeting stays readable by the user who recorded it and nobody else. A directory that
+already exists keeps the mode it was given.
 
 The sidecar:
 
@@ -97,8 +103,8 @@ exits rather than recording with a silently wrong allow-list.
 |---|---|---|---|
 | `output_dir` | string | `~/Recordings/mimi` | where recordings are written, including while in progress. `~`, `~/x` and relative values resolve against `$HOME` |
 | `meeting_bundle_prefixes` | array of strings | `company.thebrowser.`, `us.zoom.`, `com.microsoft.teams2`, `com.tinyspeck.slackmacgap`, `com.google.Chrome` | a process matches when its bundle id starts with any entry |
-| `sample_rate` | integer | `24000` | the fixed rate of the written file |
-| `bit_rate` | integer | `96000` | AAC bit rate |
+| `sample_rate` | integer | `24000` | the fixed rate of the written file; one of the twelve rates AAC carries - 8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000 |
+| `bit_rate` | integer | `96000` | AAC bit rate in bits per second, between 8000 and 320000 |
 | `stop_grace_seconds` | integer | `15` | how long the microphone must stay released before a session closes |
 | `poll_interval_ms` | integer | `1000` | how often the microphone holders are sampled |
 

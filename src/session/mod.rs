@@ -2,6 +2,7 @@ mod decide;
 
 use std::fs;
 use std::io;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -175,18 +176,31 @@ fn start_session(
         sample_rate,
         bit_rate,
     } = output;
-    if let Err(failure) = fs::create_dir_all(dir) {
+    let created = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(sink::RECORDINGS_DIR_MODE)
+        .create(dir);
+    if let Err(failure) = created {
         error!("{} is not usable: {failure}", dir.display());
         return None;
     }
 
     let started_at = Local::now();
-    let stem = sink::unused_stem(dir, sink::file_stem(started_at, &label));
-    let partial = sink::partial_path(dir, &stem);
+    let partial = match sink::reserve(dir, sink::file_stem(started_at, &label)) {
+        Ok(partial) => partial,
+        Err(failure) => {
+            error!(
+                "no recording file could be created in {}: {failure}",
+                dir.display()
+            );
+            return None;
+        }
+    };
 
     let (producer, consumer) = capture::ring(DEFAULT_SLOTS, DEFAULT_FRAMES_PER_BLOCK);
     if let Err(failure) = capture.start(devices, producer) {
         error!("capture did not start: {failure}");
+        let _ = fs::remove_file(&partial);
         return None;
     }
     let writer = writer::spawn(
@@ -312,6 +326,7 @@ pub fn devices_changed(capture: &mut impl Capture, devices: &Devices) -> Result<
 #[cfg(test)]
 mod tests {
     use std::ffi::OsStr;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, AtomicUsize};
@@ -354,7 +369,7 @@ mod tests {
 
     struct FakeCapture {
         rebuilt: Vec<Devices>,
-        starts: usize,
+        starts: Arc<AtomicUsize>,
         stops: usize,
         rebuilds: Rebuilds,
         failure: Option<(CaptureError, usize)>,
@@ -366,7 +381,7 @@ mod tests {
         fn new(failure: Option<CaptureError>) -> Self {
             Self {
                 rebuilt: Vec::new(),
-                starts: 0,
+                starts: Arc::new(AtomicUsize::new(0)),
                 stops: 0,
                 rebuilds: Rebuilds::default(),
                 failure: failure.map(|failure| (failure, usize::MAX)),
@@ -396,6 +411,10 @@ mod tests {
         fn attempts(&self) -> Arc<AtomicUsize> {
             Arc::clone(&self.attempts)
         }
+
+        fn starts(&self) -> Arc<AtomicUsize> {
+            Arc::clone(&self.starts)
+        }
     }
 
     fn owed(failure: &mut Option<(CaptureError, usize)>) -> Option<CaptureError> {
@@ -411,7 +430,7 @@ mod tests {
 
     impl Capture for FakeCapture {
         fn start(&mut self, _devices: &Devices, _producer: Producer) -> Result<(), CaptureError> {
-            self.starts += 1;
+            self.starts.fetch_add(1, Ordering::Relaxed);
             self.rebuilds = Rebuilds::default();
             let Some(failure) = owed(&mut self.start_failure) else {
                 return Ok(());
@@ -654,7 +673,7 @@ mod tests {
             "a session whose writer never failed says so in the sidecar"
         );
 
-        assert_eq!(capture.starts, 1);
+        assert_eq!(capture.starts.load(Ordering::Relaxed), 1);
         assert_eq!(capture.stops, 1);
         assert_eq!(
             capture.rebuilt,
@@ -744,6 +763,40 @@ mod tests {
     }
 
     #[test]
+    fn an_output_directory_it_created_is_reachable_only_by_its_owner() {
+        let dir = TempDir::new();
+        let nested = dir.path().join("nested/recordings");
+        let mut capture = FakeCapture::new(None);
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+
+        events
+            .send(ActivityEvent::InputTaken(process(InputState::Running)))
+            .expect("send the take");
+        drop(events);
+
+        run(
+            settings(nested.clone(), Duration::from_millis(10)),
+            devices("BuiltInMicrophoneDevice"),
+            &mut capture,
+            &sink,
+            incoming,
+            &shutdown,
+        );
+
+        let mode = fs::metadata(&nested)
+            .expect("the created output directory")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "meetings must not land in a directory group or other can read"
+        );
+    }
+
+    #[test]
     fn a_capture_that_does_not_start_records_nothing() {
         let dir = TempDir::new();
         let mut capture = FakeCapture::failing_to_start(CaptureError::NoOutputDevice);
@@ -765,7 +818,7 @@ mod tests {
             &shutdown,
         );
 
-        assert_eq!(capture.starts, 1);
+        assert_eq!(capture.starts.load(Ordering::Relaxed), 1);
         assert_eq!(sink.accepted().len(), 0, "nothing was recorded");
         assert!(
             !recording_in_progress(&dir.path()),
@@ -777,6 +830,7 @@ mod tests {
     fn a_start_that_failed_is_retried_while_the_meeting_still_holds_the_microphone() {
         let dir = TempDir::new();
         let mut capture = FakeCapture::failing_the_first_start(CaptureError::NoOutputDevice);
+        let starts = capture.starts();
         let sink = FakeSink::default();
         let shutdown = Shutdown::new();
         let (events, incoming) = mpsc::channel();
@@ -797,8 +851,10 @@ mod tests {
                 );
             });
 
+            // The retry is waited for by counting starts rather than by watching for the
+            // in-progress file: the failed attempt reserves a file too, and removes it again.
             let deadline = Instant::now() + RECOVERY * 5;
-            while !recording_in_progress(&dir.path()) && Instant::now() < deadline {
+            while starts.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(10));
             }
             shutdown.request();
@@ -806,7 +862,8 @@ mod tests {
         });
 
         assert_eq!(
-            capture.starts, 2,
+            capture.starts.load(Ordering::Relaxed),
+            2,
             "a meeting that keeps the microphone emits no second take, so the retry must come from the run loop"
         );
         assert_eq!(
@@ -893,7 +950,7 @@ mod tests {
             &shutdown,
         );
 
-        assert_eq!(capture.starts, 0);
+        assert_eq!(capture.starts.load(Ordering::Relaxed), 0);
         assert_eq!(sink.accepted().len(), 0);
     }
 }

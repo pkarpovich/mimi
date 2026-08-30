@@ -79,6 +79,13 @@ headset mode. `rebuild_needed` therefore compares a poller sample against a poll
 baseline is the `Devices` its last successful build was handed, never `Tap::sample_rate()`. Seeding
 one side of that comparison from the aggregate makes it meaningless.
 
+Every device sample the run loop holds comes from the poller, including the first one. The poller
+announces its own baseline as a `DevicesChanged` before its first pass, and `main` starts the loop
+from an unset `Devices` rather than sampling Core Audio itself. A sample taken on another thread
+before the poller existed can already be stale by the time the poller sets its baseline, and nothing
+would ever correct it: the poller emits a change, not a state, so a change inside that window is one
+the loop never hears about, and the first session would be built on devices that are gone.
+
 ## `tapautostart` is 0
 
 `kAudioAggregateDeviceTapAutoStartKey` is a start gate, not a convenience. Measured twice: with the

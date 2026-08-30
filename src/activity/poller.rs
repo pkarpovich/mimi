@@ -50,6 +50,13 @@ where
 {
     let mut processes = Vec::new();
     let mut devices = source.devices();
+    // The baseline is announced rather than kept private, so the run loop starts from devices this
+    // poller sampled. A second sample taken elsewhere before this thread existed can already be
+    // stale, and nothing would ever correct it: a change that happened in that window is a change
+    // this loop never sees.
+    let Ok(()) = events.send(ActivityEvent::DevicesChanged(devices.clone())) else {
+        return;
+    };
     loop {
         // Devices are sampled before the processes are diffed because opening the microphone is
         // what changes them: a meeting app taking the input and the rate that take forced become
@@ -214,6 +221,7 @@ mod tests {
         assert_eq!(
             collect(&source, stopped),
             vec![
+                ActivityEvent::DevicesChanged(devices("BuiltInMicrophoneDevice", 48_000.0)),
                 ActivityEvent::InputTaken(process(1, 4242, InputState::Running)),
                 ActivityEvent::Tick,
             ]
@@ -234,6 +242,7 @@ mod tests {
         assert_eq!(
             collect(&source, stopped),
             vec![
+                ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 48_000.0)),
                 ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 24_000.0)),
                 ActivityEvent::Tick,
             ]
@@ -254,6 +263,7 @@ mod tests {
         assert_eq!(
             collect(&source, stopped),
             vec![
+                ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 48_000.0)),
                 ActivityEvent::DevicesChanged(devices("20-F4-D4-60-E4-29:input", 24_000.0)),
                 ActivityEvent::InputTaken(process(1, 4242, InputState::Running)),
                 ActivityEvent::Tick,
@@ -263,14 +273,21 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_devices_emit_only_a_tick() {
+    fn the_baseline_is_announced_and_unchanged_devices_then_emit_only_a_tick() {
         let (stop, stopped) = mpsc::channel();
         drop(stop);
         let source = Fake::new(
             vec![Vec::new()],
             vec![devices("BuiltInMicrophoneDevice", 48_000.0)],
         );
-        assert_eq!(collect(&source, stopped), vec![ActivityEvent::Tick]);
+        assert_eq!(
+            collect(&source, stopped),
+            vec![
+                ActivityEvent::DevicesChanged(devices("BuiltInMicrophoneDevice", 48_000.0)),
+                ActivityEvent::Tick,
+            ],
+            "the run loop must start from devices the poller itself sampled"
+        );
     }
 
     #[test]
@@ -281,7 +298,13 @@ mod tests {
             vec![Vec::new()],
             vec![devices("BuiltInMicrophoneDevice", 48_000.0)],
         );
-        assert_eq!(collect(&source, stopped), vec![ActivityEvent::Tick]);
+        assert_eq!(
+            collect(&source, stopped),
+            vec![
+                ActivityEvent::DevicesChanged(devices("BuiltInMicrophoneDevice", 48_000.0)),
+                ActivityEvent::Tick,
+            ]
+        );
         assert_eq!(source.snapshots.load(Ordering::Relaxed), 1);
     }
 
@@ -302,10 +325,10 @@ mod tests {
             let mut events = Vec::new();
             for event in &incoming {
                 match event {
-                    ActivityEvent::Tick => {}
-                    ActivityEvent::InputTaken(_)
-                    | ActivityEvent::InputReleased(_)
-                    | ActivityEvent::DevicesChanged(_) => events.push(event),
+                    ActivityEvent::Tick | ActivityEvent::DevicesChanged(_) => {}
+                    ActivityEvent::InputTaken(_) | ActivityEvent::InputReleased(_) => {
+                        events.push(event)
+                    }
                 }
                 if events.len() == 2 {
                     break;
