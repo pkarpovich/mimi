@@ -19,7 +19,9 @@ use argh::FromArgs;
 
 use crate::activity::poller::{self, CoreAudio};
 use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
-use crate::capture::{Capture, CaptureConfig, Producer, Tap};
+use crate::capture::{
+    Capture, CaptureConfig, Consumer, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Drained, Tap,
+};
 use crate::session::{Decider, SessionCommand, SessionStart};
 
 const AGGREGATE_NAME: &str = "mimi";
@@ -120,7 +122,7 @@ fn run() -> ExitCode {
     let sampler = CoreAudio::live();
     let mut devices = sampler.devices();
     let mut capture = Tap::new(CaptureConfig::new(AGGREGATE_NAME, AGGREGATE_UID));
-    let mut recording: Option<Producer> = None;
+    let mut recording: Option<Recording> = None;
     let (events, incoming) = mpsc::channel();
     let (_stop, stopped) = mpsc::channel();
     thread::spawn(move || poller::poll(&CoreAudio::live(), interval, stopped, events));
@@ -134,9 +136,15 @@ fn run() -> ExitCode {
                 }
                 SessionCommand::Stop => {
                     capture.stop();
-                    match &recording {
-                        Some(producer) => {
-                            println!("session stop: {} blocks delivered", producer.delivered());
+                    match &mut recording {
+                        Some(recording) => {
+                            drain(recording);
+                            let Recording {
+                                consumer: _,
+                                blocks,
+                                dropped,
+                            } = recording;
+                            println!("session stop: {blocks} blocks, {dropped} dropped");
                         }
                         None => println!("session stop"),
                     }
@@ -144,6 +152,10 @@ fn run() -> ExitCode {
                 }
             }
         }
+        if let Some(recording) = &mut recording {
+            drain(recording);
+        }
+
         match event {
             ActivityEvent::InputTaken(process) => println!("input taken by {}", describe(&process)),
             ActivityEvent::InputReleased(process) => {
@@ -163,18 +175,42 @@ fn run() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn start_capture(capture: &mut Tap, devices: &Devices) -> Option<Producer> {
-    let producer = Producer::new();
-    let Err(error) = capture.start(devices, producer.clone()) else {
+struct Recording {
+    consumer: Consumer,
+    blocks: u64,
+    dropped: u64,
+}
+
+fn start_capture(capture: &mut Tap, devices: &Devices) -> Option<Recording> {
+    let (producer, consumer) = capture::ring(DEFAULT_SLOTS, DEFAULT_FRAMES_PER_BLOCK);
+    let Err(error) = capture.start(devices, producer) else {
         println!(
             "capture started: {:?} Hz, tracks {:?}",
             capture.sample_rate(),
             capture.tracks()
         );
-        return Some(producer);
+        return Some(Recording {
+            consumer,
+            blocks: 0,
+            dropped: 0,
+        });
     };
     eprintln!("mimi: capture did not start: {error}");
     None
+}
+
+fn drain(recording: &mut Recording) {
+    let Recording {
+        consumer,
+        blocks,
+        dropped,
+    } = recording;
+    let Drained {
+        blocks: drained,
+        dropped: missed,
+    } = consumer.drain();
+    *blocks += drained.len() as u64;
+    *dropped += missed;
 }
 
 fn rebuild_capture(capture: &mut Tap, devices: &Devices) {

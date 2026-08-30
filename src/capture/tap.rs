@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ffi::CStr;
 use std::ptr::NonNull;
 
@@ -15,11 +16,11 @@ use objc2_core_audio::{
     kAudioAggregateDeviceUIDKey, kAudioDevicePropertyNominalSampleRate,
     kAudioSubDeviceDriftCompensationKey, kAudioSubDeviceUIDKey, kAudioSubTapUIDKey,
 };
-use objc2_core_audio_types::{AudioBufferList, AudioTimeStamp};
+use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp};
 use objc2_core_foundation::{CFArray, CFDictionary, CFNumber, CFRetained, CFString, CFType};
 use objc2_foundation::{NSArray, NSNumber, NSString};
 
-use super::{Capture, CaptureConfig, CaptureError, Producer, TrackKind};
+use super::{BlockRef, Capture, CaptureConfig, CaptureError, Producer, TrackKind};
 use crate::activity::{DeviceUid, Devices};
 use crate::macos;
 
@@ -37,6 +38,7 @@ pub struct Tap {
     io: Io,
     sample_rate: Option<f64>,
     tracks: Vec<TrackKind>,
+    generation: u64,
 }
 
 impl Tap {
@@ -50,6 +52,7 @@ impl Tap {
             io: Io::Stopped,
             sample_rate: None,
             tracks: Vec::new(),
+            generation: 0,
         }
     }
 
@@ -94,7 +97,8 @@ impl Tap {
         };
         self.sample_rate = Some(sample_rate);
 
-        let io_proc = create_io_proc(aggregate, producer)?;
+        self.generation += 1;
+        let io_proc = create_io_proc(aggregate, producer, self.generation)?;
         self.io_proc = io_proc;
 
         let status = unsafe { AudioDeviceStart(aggregate, io_proc) };
@@ -378,14 +382,27 @@ fn create_aggregate(
 fn create_io_proc(
     device: AudioObjectID,
     producer: Producer,
+    generation: u64,
 ) -> Result<AudioDeviceIOProcID, CaptureError> {
+    let scratch = RefCell::new(Vec::<f32>::with_capacity(producer.frames_per_block()));
     let block = RcBlock::new(
         move |_now: NonNull<AudioTimeStamp>,
-              _input: NonNull<AudioBufferList>,
-              _input_time: NonNull<AudioTimeStamp>,
+              input: NonNull<AudioBufferList>,
+              input_time: NonNull<AudioTimeStamp>,
               _output: NonNull<AudioBufferList>,
               _output_time: NonNull<AudioTimeStamp>| {
-            producer.push();
+            let Ok(mut system) = scratch.try_borrow_mut() else {
+                return;
+            };
+            let frames = unsafe { copy_system_track(input, &mut system) };
+            let host_time = unsafe { input_time.as_ref() }.mHostTime;
+            producer.push(BlockRef {
+                microphone: &[],
+                system: system.as_slice(),
+                frames,
+                host_time,
+                generation,
+            });
         },
     );
     let mut io_proc: AudioDeviceIOProcID = None;
@@ -404,6 +421,35 @@ fn create_io_proc(
         return Err(CaptureError::IoProcCreate(status));
     };
     Ok(io_proc)
+}
+
+unsafe fn copy_system_track(input: NonNull<AudioBufferList>, samples: &mut Vec<f32>) -> usize {
+    samples.clear();
+    let list = unsafe { input.as_ref() };
+    let count = list.mNumberBuffers as usize;
+    if count == 0 {
+        return 0;
+    }
+    let buffers = unsafe { std::slice::from_raw_parts(list.mBuffers.as_ptr(), count) };
+    let AudioBuffer {
+        mNumberChannels: channels,
+        mDataByteSize: bytes,
+        mData: data,
+    } = buffers[count - 1];
+    let channels = channels as usize;
+    if channels == 0 {
+        return 0;
+    }
+    let Some(data) = NonNull::new(data.cast::<f32>()) else {
+        return 0;
+    };
+    let frames = bytes as usize / size_of::<f32>() / channels;
+    let frames = frames.min(samples.capacity());
+    let data = unsafe { std::slice::from_raw_parts(data.as_ptr(), frames * channels) };
+    for frame in 0..frames {
+        samples.push(data[frame * channels]);
+    }
+    frames
 }
 
 fn stop_device(device: Option<AudioObjectID>, io_proc: AudioDeviceIOProcID) {
@@ -681,8 +727,9 @@ mod tests {
             output: None,
             sample_rate: None,
         };
+        let (producer, _consumer) = crate::capture::ring(2, 8);
         assert_eq!(
-            capture.start(&devices, Producer::new()),
+            capture.start(&devices, producer),
             Err(CaptureError::NoOutputDevice)
         );
         assert_eq!(capture.sample_rate(), None);

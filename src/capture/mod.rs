@@ -1,12 +1,13 @@
+mod ring;
 mod tap;
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 
 use crate::activity::Devices;
 
+pub use ring::{
+    BlockRef, Consumer, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Drained, Producer, ring,
+};
 pub use tap::Tap;
 
 /// TrackKind names the two tracks capture keeps apart until the writer folds them into one file.
@@ -29,32 +30,6 @@ impl CaptureConfig {
             name: name.into(),
             aggregate_uid: aggregate_uid.into(),
         }
-    }
-}
-
-/// Producer is the write end the IOProc reports every delivered block on.
-#[derive(Clone)]
-pub struct Producer(Arc<AtomicU64>);
-
-impl Producer {
-    pub fn new() -> Self {
-        Self(Arc::new(AtomicU64::new(0)))
-    }
-
-    pub fn push(&self) {
-        let Self(delivered) = self;
-        delivered.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn delivered(&self) -> u64 {
-        let Self(delivered) = self;
-        delivered.load(Ordering::Relaxed)
-    }
-}
-
-impl Default for Producer {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -90,20 +65,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_producer_counts_the_blocks_pushed_into_it() {
-        let producer = Producer::new();
-        assert_eq!(producer.delivered(), 0);
-        producer.push();
-        producer.push();
-        assert_eq!(producer.delivered(), 2);
-    }
-
-    #[test]
-    fn a_cloned_producer_shares_the_count() {
-        let producer = Producer::new();
+    fn a_cloned_producer_writes_into_the_same_ring() {
+        let (producer, mut consumer) = ring(4, 8);
         let other = producer.clone();
-        other.push();
-        assert_eq!(producer.delivered(), 1);
+        other.push(BlockRef {
+            microphone: &[],
+            system: &[0.5],
+            frames: 1,
+            host_time: 3,
+            generation: 0,
+        });
+
+        let Drained { blocks, dropped } = consumer.drain();
+        assert_eq!(dropped, 0);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].host_time, 3);
     }
 
     #[test]
