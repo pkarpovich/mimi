@@ -14,7 +14,8 @@ cd "$root"
 cargo build --release
 
 binary="target/release/mimi"
-codesign --force --options runtime --timestamp --sign "$identity" "$binary"
+codesign --force --options runtime --timestamp --entitlements mimi.entitlements --sign "$identity" "$binary"
 codesign --verify --strict --verbose=2 "$binary"
+codesign -d --entitlements - "$binary"
 
 echo "signed $root/$binary as $identity"

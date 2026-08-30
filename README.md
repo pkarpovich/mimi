@@ -123,6 +123,10 @@ security find-identity -v -p codesigning
 ./scripts/build-signed.sh "Developer ID Application: Your Name (TEAMID)"
 ```
 
+The script signs with the hardened runtime, which denies the microphone outright unless the binary
+carries `com.apple.security.device.audio-input` - `mimi.entitlements` is what grants it, and the
+script prints the entitlements back after signing so you can see it took.
+
 Then install the LaunchAgent, which points at the executable you run `install` from:
 
 ```sh
