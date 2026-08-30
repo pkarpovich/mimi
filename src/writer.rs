@@ -22,7 +22,8 @@ use thiserror::Error;
 
 use crate::capture::{Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict};
 
-const CHANNELS: u32 = 2;
+/// CHANNELS is how many channels a recording carries: the microphone left, everyone else right.
+pub const CHANNELS: u32 = 2;
 const AAC_FRAMES_PER_PACKET: u32 = 1024;
 const DRAIN_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -765,18 +766,10 @@ mod tests {
 
     #[test]
     fn a_block_of_no_frames_resamples_to_nothing() {
-        assert_eq!(
-            resampled(&[Vec::new()], 24_000.0, 48_000.0),
-            vec![Vec::new()]
-        );
-        assert_eq!(
-            resampled(&[vec![0.5, 0.5]], 0.0, 48_000.0),
-            vec![Vec::new()]
-        );
-        assert_eq!(
-            resampled(&[vec![0.5, 0.5]], 24_000.0, 0.0),
-            vec![Vec::new()]
-        );
+        let nothing: Vec<Vec<f32>> = vec![Vec::new()];
+        assert_eq!(resampled(&[Vec::new()], 24_000.0, 48_000.0), nothing);
+        assert_eq!(resampled(&[vec![0.5, 0.5]], 0.0, 48_000.0), nothing);
+        assert_eq!(resampled(&[vec![0.5, 0.5]], 24_000.0, 0.0), nothing);
     }
 
     #[test]

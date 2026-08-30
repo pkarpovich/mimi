@@ -8,26 +8,23 @@ mod capture;
 mod config;
 mod macos;
 mod session;
+mod sink;
 mod writer;
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use argh::FromArgs;
-use chrono::Local;
 
+use crate::activity::DeviceSource;
 use crate::activity::poller::{self, CoreAudio};
-use crate::activity::{ActivityEvent, AudioProcess, DeviceSource, Devices};
-use crate::capture::{
-    Capture, CaptureConfig, DEFAULT_FRAMES_PER_BLOCK, DEFAULT_SLOTS, Rebuilds, Tap,
-};
+use crate::capture::{CaptureConfig, Tap};
 use crate::config::Config;
-use crate::session::{Decider, SessionCommand, SessionStart};
-use crate::writer::{Finished, Writer, WriterSettings};
+use crate::session::{Settings, Shutdown};
+use crate::sink::LocalFolder;
 
 const AGGREGATE_NAME: &str = "mimi";
 const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
@@ -130,138 +127,36 @@ fn run() -> ExitCode {
         poll_interval_ms,
     } = config;
 
+    let shutdown = Shutdown::new();
+    if let Err(error) = shutdown.install() {
+        eprintln!("mimi: the signal handlers could not be installed: {error}");
+        return ExitCode::FAILURE;
+    }
+
     let interval = Duration::from_millis(poll_interval_ms.into());
-    let grace = Duration::from_secs(stop_grace_seconds.into());
-    let mut decider = Decider::new(meeting_bundle_prefixes, grace);
-    let sampler = CoreAudio::live();
-    let mut devices = sampler.devices();
+    let devices = CoreAudio::live().devices();
     let mut capture = Tap::new(CaptureConfig::new(AGGREGATE_NAME, AGGREGATE_UID));
-    let mut recording: Option<Recording> = None;
     let (events, incoming) = mpsc::channel();
-    let (_stop, stopped) = mpsc::channel();
+    let (stop, stopped) = mpsc::channel();
     thread::spawn(move || poller::poll(&CoreAudio::live(), interval, stopped, events));
 
-    for event in incoming {
-        for command in decider.observe(&event, Instant::now()) {
-            match command {
-                SessionCommand::Start(SessionStart { bundle_id, label }) => {
-                    println!("session start: {label} ({})", bundle_id.as_str());
-                    recording = start_recording(
-                        &mut capture,
-                        &devices,
-                        &Output {
-                            dir: &output_dir,
-                            label: &label,
-                            sample_rate,
-                            bit_rate,
-                        },
-                    );
-                }
-                SessionCommand::Stop => {
-                    capture.stop();
-                    let Rebuilds { succeeded, failed } = capture.rebuilds();
-                    match recording.take() {
-                        Some(Recording { path, writer }) => {
-                            let Finished { error, verdict } = writer.finish();
-                            match error {
-                                Some(error) => {
-                                    eprintln!("mimi: writing {} failed: {error}", path.display());
-                                }
-                                None => println!(
-                                    "session stop: wrote {} ({verdict:?}, {succeeded} rebuilds, \
-                                     {failed} failed)",
-                                    path.display()
-                                ),
-                            }
-                        }
-                        None => println!("session stop"),
-                    }
-                }
-            }
-        }
+    session::run(
+        Settings {
+            output_dir,
+            prefixes: meeting_bundle_prefixes,
+            sample_rate,
+            bit_rate,
+            grace: Duration::from_secs(stop_grace_seconds.into()),
+        },
+        devices,
+        &mut capture,
+        &LocalFolder,
+        incoming,
+        &shutdown,
+    );
 
-        match event {
-            ActivityEvent::InputTaken(process) => println!("input taken by {}", describe(&process)),
-            ActivityEvent::InputReleased(process) => {
-                println!("input released by {}", describe(&process));
-            }
-            ActivityEvent::DevicesChanged(sampled) => {
-                println!("devices changed: {sampled:?}");
-                devices = sampled;
-                if recording.is_some() {
-                    session::devices_changed(&mut capture, &devices);
-                }
-            }
-            ActivityEvent::Tick => {}
-        }
-    }
-
+    drop(stop);
     ExitCode::SUCCESS
-}
-
-struct Recording {
-    path: PathBuf,
-    writer: Writer,
-}
-
-struct Output<'a> {
-    dir: &'a Path,
-    label: &'a str,
-    sample_rate: u32,
-    bit_rate: u32,
-}
-
-fn start_recording(capture: &mut Tap, devices: &Devices, output: &Output<'_>) -> Option<Recording> {
-    let Output {
-        dir,
-        label,
-        sample_rate,
-        bit_rate,
-    } = output;
-    if let Err(error) = fs::create_dir_all(dir) {
-        eprintln!("mimi: {} is not usable: {error}", dir.display());
-        return None;
-    }
-    let path = dir.join(format!(
-        "{}-{label}.aac.partial",
-        Local::now().format("%Y-%m-%dT%H-%M-%S")
-    ));
-
-    let (producer, consumer) = capture::ring(DEFAULT_SLOTS, DEFAULT_FRAMES_PER_BLOCK);
-    let Err(error) = capture.start(devices, producer) else {
-        println!(
-            "capture started: {:?} Hz, tracks {:?}",
-            capture.sample_rate(),
-            capture.tracks()
-        );
-        let writer = writer::spawn(
-            WriterSettings {
-                path: path.clone(),
-                sample_rate: *sample_rate,
-                bit_rate: *bit_rate,
-            },
-            consumer,
-            capture.formats(),
-        );
-        return Some(Recording { path, writer });
-    };
-    eprintln!("mimi: capture did not start: {error}");
-    None
-}
-
-fn describe(process: &AudioProcess) -> String {
-    let AudioProcess {
-        object,
-        bundle_id,
-        pid,
-        input: _,
-        output: _,
-    } = process;
-    let bundle_id = match bundle_id {
-        Some(bundle_id) => bundle_id.as_str(),
-        None => "<unknown>",
-    };
-    format!("{object} pid={pid} {bundle_id}")
 }
 
 fn install() -> ExitCode {
