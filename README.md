@@ -116,6 +116,8 @@ Then install the LaunchAgent, which points at the executable you run `install` f
 
 That writes `~/Library/LaunchAgents/dev.pkarpovich.mimi.plist` with `RunAtLoad` and `KeepAlive`, and loads it with `launchctl bootstrap gui/<uid>`. Re-installing over a loaded agent replaces it.
 
+Installed from the cask, this runs by itself: the cask's `postflight` calls `mimi install` after every install and every upgrade. That is not decoration - Homebrew upgrades a cask by uninstalling the old version first, and the uninstall stanza unloads the agent and deletes its plist, so without the postflight the daemon would be gone after each upgrade and nothing would say so.
+
 ```sh
 mimi uninstall
 ```
