@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.pkarpovich.mimi</string>
+	<key>CFBundleName</key>
+	<string>mimi</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>mimi records your microphone while a meeting application is using it.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>mimi records the audio of the other meeting participants.</string>
+</dict>
+</plist>

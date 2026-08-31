@@ -1,0 +1,23 @@
+[package]
+name = "mimi"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+argh = "0.1.19"
+block2 = "0.6.2"
+chrono = "0.4.45"
+libc = "0.2.189"
+objc2 = "0.6.4"
+objc2-audio-toolbox = { version = "0.3.2", features = ["ExtendedAudioFile", "AudioFile", "AudioConverter", "objc2-core-audio-types", "objc2-core-foundation"] }
+objc2-core-audio = { version = "0.3.2", features = ["AudioHardware", "objc2", "objc2-foundation", "objc2-core-audio-types", "block2", "dispatch2"] }
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"
+objc2-foundation = "0.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+signal-hook = "0.4.4"
+thiserror = "2.0.20"
+toml = "1.1.4"
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
