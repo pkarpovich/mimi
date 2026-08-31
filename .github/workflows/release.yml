@@ -182,20 +182,25 @@ jobs:
             app "Mimi.app"
             binary "#{appdir}/Mimi.app/Contents/MacOS/mimi"
 
+            # Homebrew upgrades a cask by uninstalling the old version first, and the
+            # uninstall stanza below unloads the agent and removes its plist. Without
+            # this the daemon is simply gone after every upgrade, silently. postflight
+            # runs on install and on upgrade alike, and mimi install is idempotent.
+            postflight do
+              system_command "#{appdir}/Mimi.app/Contents/MacOS/mimi",
+                             args: ["install"]
+            end
+
             caveats <<~CAVEATS
-              mimi runs with its defaults and needs no configuration to start.
-              To change where recordings land or which applications trigger one,
-              write ~/.config/mimi/config.toml - see the README for the keys -
-              and check it with:
+              mimi starts on its own: installing the cask writes the launchd
+              agent dev.pkarpovich.mimi and loads it, and an upgrade does the
+              same again. Nothing to run by hand.
+
+              It records with its defaults. To change where recordings land or
+              which applications trigger one, write ~/.config/mimi/config.toml -
+              see the README for the keys - and check it with:
 
                 mimi --check-config
-
-              Then:
-
-                mimi install
-
-              That writes the launchd agent dev.pkarpovich.mimi and starts it.
-              An upgrade replaces the app in place and needs nothing further.
 
               The first time a meeting starts, macOS asks for the microphone.
               Granting it is what makes the recording carry your voice; without
