@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Local, SecondsFormat};
 use serde::Serialize;
 use thiserror::Error;
+use tracing::{info, warn};
 
 use crate::activity::BundleId;
 use crate::capture::Verdict;
+use crate::remux;
 use crate::writer::Written;
 
 const AUDIO_EXTENSION: &str = "aac";
@@ -86,6 +88,20 @@ impl Sink for LocalFolder {
                 source,
             });
         }
+
+        let completed = match remux::to_m4a(&completed, &remux::destination_for(&completed)) {
+            Ok(remux::Remuxed { path, packets }) => {
+                info!("{} carries {packets} packets", path.display());
+                if let Err(source) = fs::remove_file(&completed) {
+                    warn!("{} could not be removed: {source}", completed.display());
+                }
+                path
+            }
+            Err(error) => {
+                warn!("{} was kept as it is: {error}", completed.display());
+                completed
+            }
+        };
 
         let described = match serde_json::to_vec_pretty(&sidecar) {
             Ok(described) => described,
