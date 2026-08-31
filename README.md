@@ -6,6 +6,12 @@ mimi watches which processes hold the microphone. When one of the configured mee
 
 It never opens the microphone speculatively. Nothing is recorded until a process whose bundle id matches the allow-list is already holding the input.
 
+## The name
+
+**mimi** is 耳, Japanese for "ears".
+
+It is the companion of [nikki](https://github.com/pkarpovich/nikki) - 日記, "diary" - the daemon that records what was on screen and what was being done. nikki watches, mimi listens. Both run as launchd agents on the same Mac under the same `dev.pkarpovich.*` prefix, and neither knows the other exists.
+
 ## What it records
 
 - One ADTS AAC file per session, stereo, at a fixed sample rate (24000 Hz by default).
