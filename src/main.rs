@@ -8,6 +8,7 @@ mod capture;
 mod config;
 mod instance;
 mod macos;
+mod remux;
 mod service;
 mod session;
 mod sink;

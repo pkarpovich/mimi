@@ -1,3 +1,5 @@
+pub mod audiofile;
+
 use std::ffi::c_void;
 use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
