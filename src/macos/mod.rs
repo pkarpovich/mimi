@@ -170,3 +170,32 @@ mod tests {
         assert_eq!(read_object_ids(object, UNKNOWN_SELECTOR), None);
     }
 }
+
+/// Lock answers whether an exclusive advisory lock could be taken without waiting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lock {
+    Taken,
+    HeldByAnother,
+    Failed(i32),
+}
+
+/// try_lock takes an exclusive advisory lock on an open file, never waiting for the holder.
+///
+/// The lock lives on the open file description, so it is released when the file is closed or the
+/// process dies - including a kill that runs no cleanup, which is exactly when a stale lock would
+/// otherwise keep the daemon from ever starting again.
+pub fn try_lock(file: &std::fs::File) -> Lock {
+    use std::os::unix::io::AsRawFd;
+    let taken = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if taken == 0 {
+        return Lock::Taken;
+    }
+    let error = std::io::Error::last_os_error();
+    let Some(code) = error.raw_os_error() else {
+        return Lock::Failed(0);
+    };
+    if code == libc::EWOULDBLOCK {
+        return Lock::HeldByAnother;
+    }
+    Lock::Failed(code)
+}
