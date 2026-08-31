@@ -6,10 +6,6 @@
 	<string>dev.pkarpovich.mimi</string>
 	<key>CFBundleName</key>
 	<string>mimi</string>
-	<key>CFBundleExecutable</key>
-	<string>mimi</string>
-	<key>CFBundlePackageType</key>
-	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>__VERSION__</string>
 	<key>CFBundleVersion</key>

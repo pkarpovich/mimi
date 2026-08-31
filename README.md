@@ -104,6 +104,10 @@ security find-identity -v -p codesigning
 
 The script signs with the hardened runtime, which denies the microphone outright unless the binary carries `com.apple.security.device.audio-input` - `mimi.entitlements` is what grants it, and the script prints the entitlements back after signing so you can see it took.
 
+For distribution there is `scripts/bundle.sh <binary> <out-dir> [identity]`, which assembles `Mimi.app` around the same binary, gives it the icon and `LSUIElement`, and signs the bundle with the same entitlements. The bundle exists for one reason: TCC identifies a bundle by its identifier at a path that does not move, and a loose binary by its absolute path - which any package manager changes on every version, taking the microphone grant with it. The icon comes from `assets/AppIcon.icns`, which is committed; `scripts/icon.sh` regenerates it from `assets/icon.svg` through a headless browser and `iconutil`, and only needs running when the artwork changes.
+
+The bundle-only keys (`CFBundleExecutable`, `CFBundlePackageType`, `LSUIElement`, `CFBundleIconFile`) are deliberately absent from `Info.plist.template` and added by `bundle.sh`, because `build.rs` embeds that template into the bare binary and declaring a loose daemon an `APPL` bundle makes macOS treat it as a UI application.
+
 Then install the LaunchAgent, which points at the executable you run `install` from:
 
 ```sh
