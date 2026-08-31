@@ -138,7 +138,7 @@ Grant whatever macOS prompts for on the first recorded session. If no prompt app
 
 ## Logs
 
-Every event goes to stderr, so under the LaunchAgent the file to read is `~/Library/Logs/mimi.err.log`. `~/Library/Logs/mimi.log` is the agent's `StandardOutPath` and stays empty. mimi logs one event per session start, session end, device rebuild, rebuild failure, silence verdict and dropped ring blocks.
+Every event goes to stderr, so under the LaunchAgent the file to read is `~/Library/Logs/mimi.err.log`. `~/Library/Logs/mimi.log` is the agent's `StandardOutPath` and stays empty. mimi logs its version at startup, then one event per session start, session end, device rebuild, rebuild failure, silence verdict and dropped ring blocks. `mimi --version` (or `-V`) prints the same version, which is what tells you whether an upgrade actually took.
 
 ## Development
 
