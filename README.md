@@ -10,7 +10,7 @@ It never opens the microphone speculatively. Nothing is recorded until a process
 
 **mimi** is 耳, Japanese for "ears".
 
-It is the companion of [nikki](https://github.com/pkarpovich/nikki) - 日記, "diary" - the daemon that records what was on screen and what was being done. nikki watches, mimi listens. Both run as launchd agents on the same Mac under the same `dev.pkarpovich.*` prefix, and neither knows the other exists.
+It is the companion of [nikki](https://github.com/pkarpovich/nikki) - 日記, "diary" - the daemon that records what was on screen and what was being done. nikki watches, mimi listens.
 
 ## What it records
 
