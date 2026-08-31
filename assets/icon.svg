@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>mimi</title>
+  <rect x="100.0" y="100.0" width="824.0" height="824.0" rx="185.4" fill="#100f0d" />
+  <g fill="#cecdc3">
+    <rect x="380.16" y="413.12" width="82.4" height="197.76" />
+    <rect x="561.44" y="314.24" width="82.4" height="395.52" />
+    <rect x="742.72" y="182.4" width="82.4" height="659.2" />
+  </g>
+  <rect x="199.04" y="462.56" width="98.88" height="98.88" rx="16.48" fill="#d0a215" />
+</svg>
