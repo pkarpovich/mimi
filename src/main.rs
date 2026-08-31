@@ -6,6 +6,7 @@ mod plist;
 mod activity;
 mod capture;
 mod config;
+mod instance;
 mod macos;
 mod service;
 mod session;
@@ -117,6 +118,20 @@ fn run() -> ExitCode {
         eprintln!("mimi: HOME is not set");
         return ExitCode::FAILURE;
     };
+
+    let lock = instance::lock_path(&home);
+    let _guard = match instance::claim(&lock) {
+        Ok(instance::Claim::Held(guard)) => guard,
+        Ok(instance::Claim::AlreadyRunning) => {
+            eprintln!("mimi: another instance is already running");
+            return ExitCode::FAILURE;
+        }
+        Err(error) => {
+            eprintln!("mimi: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let config = match config::load(&home) {
         Ok(config) => config,
         Err(error) => {

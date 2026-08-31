@@ -124,6 +124,8 @@ unloads the agent and removes the plist. Recordings and logs are left alone.
 
 You can also run it in the foreground - `mimi run`, or just `mimi` - and stop it with Ctrl-C. SIGINT and SIGTERM close any recording in progress through the normal session-end path, so the file is renamed and its sidecar is written.
 
+Only one mimi runs at a time. A second one exits immediately with `another instance is already running`, holding an advisory lock on `~/Library/Application Support/mimi/instance.lock` for the life of the process. Without that refusal the second daemon looks alive but records nothing: its aggregate device carries the same UID as the first one's, Core Audio refuses to create it, and the failure repeats once per poll while the first daemon keeps writing files - so everything appears to work while the instance you actually installed is dead. The lock lives on the open file, so a `kill -9` releases it too.
+
 ## Permissions
 
 mimi carries `NSMicrophoneUsageDescription` and `NSAudioCaptureUsageDescription` in an `__info_plist` section embedded in the binary itself, so it needs no app bundle. It needs:
