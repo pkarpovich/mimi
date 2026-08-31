@@ -21,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 
 use argh::FromArgs;
-use tracing::Level;
+use tracing::{Level, info};
 
 use crate::activity::Devices;
 use crate::activity::poller::{self, CoreAudio};
@@ -36,6 +36,10 @@ const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
 struct Cli {
+    /// print the version and exit
+    #[argh(switch, short = 'V')]
+    version: bool,
+
     /// load the configuration, print it, and exit
     #[argh(switch)]
     check_config: bool,
@@ -69,9 +73,15 @@ struct UninstallCommand {}
 
 fn main() -> ExitCode {
     let Cli {
+        version,
         check_config,
         command,
     } = argh::from_env();
+
+    if version {
+        println!("{}", self::version());
+        return ExitCode::SUCCESS;
+    }
 
     if check_config {
         return print_config();
@@ -83,6 +93,11 @@ fn main() -> ExitCode {
         Some(Command::Install(InstallCommand {})) => install(),
         Some(Command::Uninstall(UninstallCommand {})) => uninstall(),
     }
+}
+
+/// version is what `mimi --version` prints, and what the log carries at startup.
+fn version() -> String {
+    format!("mimi {}", env!("CARGO_PKG_VERSION"))
 }
 
 fn print_config() -> ExitCode {
@@ -114,6 +129,7 @@ fn run() -> ExitCode {
         .with_writer(std::io::stderr)
         .with_max_level(Level::INFO)
         .init();
+    info!("{} starting", version());
 
     let Some(home) = home_dir() else {
         eprintln!("mimi: HOME is not set");
@@ -220,5 +236,17 @@ fn uninstall() -> ExitCode {
             eprintln!("mimi: {error}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_version_names_the_program_and_the_crate_version() {
+        let printed = version();
+        assert!(printed.starts_with("mimi "));
+        assert!(printed.contains(env!("CARGO_PKG_VERSION")));
     }
 }
