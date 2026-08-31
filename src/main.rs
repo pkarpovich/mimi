@@ -119,10 +119,6 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // Held for the life of the process. A second daemon cannot record anyway - its aggregate device
-    // carries the same UID as the first one's and Core Audio refuses to create it - but it fails
-    // that way silently, once per poll, while the first one keeps recording and the user sees files
-    // appearing. Refusing to start is the only way that becomes visible.
     let lock = instance::lock_path(&home);
     let _guard = match instance::claim(&lock) {
         Ok(instance::Claim::Held(guard)) => guard,

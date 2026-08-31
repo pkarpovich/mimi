@@ -26,12 +26,7 @@ pub enum Claim {
     AlreadyRunning,
 }
 
-/// Guard keeps the lock for as long as it is alive, which is the life of the process.
-///
-/// Two daemons cannot record at once: the second one's aggregate device carries the same UID as the
-/// first one's, and Core Audio refuses to create it. That refusal is silent to the user - the second
-/// process keeps polling and failing while the first keeps recording - so the second one has to
-/// notice at startup instead.
+/// Guard holds the lock for as long as it is alive.
 #[derive(Debug)]
 pub struct Guard {
     _file: File,
