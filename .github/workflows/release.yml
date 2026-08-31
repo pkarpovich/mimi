@@ -1,0 +1,233 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Must never change: macOS ties the microphone grant to the signing identity
+  # plus this identifier. A different value makes every upgrade look like a new
+  # program, the grant is lost, and the daemon records silence on the left
+  # channel without failing.
+  BUNDLE_ID: dev.pkarpovich.mimi
+  # Apple Silicon only. The crate links Apple frameworks, the runner is arm64,
+  # so this is the native target and nothing is cross-compiled.
+  TARGET: aarch64-apple-darwin
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: jdx/mise-action@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag that disagrees with Cargo.toml would ship a binary whose version
+      # nobody can trace back, and the cask would carry the wrong number.
+      - name: Tag matches the crate version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          crate=$(mise exec -- cargo metadata --no-deps --format-version 1 |
+            python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "$tag" != "$crate" ]; then
+            echo "tag $tag does not match Cargo.toml $crate" >&2
+            exit 1
+          fi
+
+      - run: mise run check
+
+      - run: mise exec -- cargo build --release --target "$TARGET"
+
+      # build.rs embeds Info.plist into __TEXT,__info_plist. Without the two
+      # usage strings there macOS never shows the prompts, the daemon is denied
+      # for the life of the binary, and the only symptom is a recording whose
+      # tracks are digital silence - which no test can see.
+      - name: Info.plist is embedded
+        run: |
+          binary="target/$TARGET/release/mimi"
+          plist=$(mktemp)
+          otool -P "$binary" | tail -n +3 > "$plist"
+          plutil -lint "$plist"
+          identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist")
+          if [ "$identifier" != "$BUNDLE_ID" ]; then
+            echo "CFBundleIdentifier is $identifier, not $BUNDLE_ID" >&2
+            exit 1
+          fi
+          for key in NSMicrophoneUsageDescription NSAudioCaptureUsageDescription; do
+            usage=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")
+            if [ -z "$usage" ]; then
+              echo "$key is empty" >&2
+              exit 1
+            fi
+          done
+
+      - uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          p12-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+
+      # The app bundle is the whole point of shipping a cask: TCC identifies a
+      # bundle by its identifier at a path that never moves, and a loose binary
+      # by its path alone - which Homebrew changes on every version, losing the
+      # microphone grant on each upgrade.
+      - name: Bundle and sign
+        env:
+          TEAM_ID: ${{ secrets.MACOS_TEAM_ID }}
+        run: |
+          identity=$(security find-identity -v -p codesigning |
+            grep "Developer ID Application" | grep "($TEAM_ID)" |
+            head -n 1 | awk '{print $2}')
+          if [ -z "$identity" ]; then
+            echo "no Developer ID Application identity for team $TEAM_ID" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          ./scripts/bundle.sh "target/$TARGET/release/mimi" dist "$identity"
+
+      # The hardened runtime denies the microphone outright unless the signature
+      # carries the entitlement, and a bundle that lost it looks healthy right
+      # up to the moment it records nothing.
+      - name: The signed bundle carries the microphone entitlement
+        run: |
+          if ! codesign -d --entitlements - dist/Mimi.app 2>&1 |
+            grep -q "com.apple.security.device.audio-input"; then
+            echo "the signed bundle has no audio-input entitlement" >&2
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          ditto -c -k --keepParent dist/Mimi.app "dist/Mimi-arm64-$version.zip"
+          rm -rf dist/Mimi.app
+          cd dist && shasum -a 256 *.zip > checksums.txt && cat checksums.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.zip
+            dist/checksums.txt
+          generate_release_notes: true
+
+  cask:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Read the version and the checksum
+        id: facts
+        run: |
+          {
+            version="${GITHUB_REF_NAME#v}"
+            echo "version=$version"
+            echo "sha=$(shasum -a 256 "dist/Mimi-arm64-$version.zip" | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: pkarpovich/homebrew-apps
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Write the cask
+        env:
+          VERSION: ${{ steps.facts.outputs.version }}
+          SHA: ${{ steps.facts.outputs.sha }}
+        run: |
+          mkdir -p tap/Casks
+          cat > tap/Casks/mimi.rb <<EOF
+          cask "mimi" do
+            version "${VERSION}"
+            sha256 "${SHA}"
+
+            url "https://github.com/pkarpovich/mimi/releases/download/v#{version}/Mimi-arm64-#{version}.zip"
+            name "mimi"
+            desc "macOS meeting recorder daemon"
+            homepage "https://github.com/pkarpovich/mimi"
+
+            depends_on arch: :arm64
+            depends_on macos: ">= :sonoma"
+
+            # The app is what makes the microphone grant durable. TCC identifies a
+            # bundle by its identifier at a path that never moves, and a loose binary
+            # by its path alone - which a versioned Cellar path changes on every
+            # upgrade. The binary stanza keeps \`mimi\` on PATH, pointing inside the
+            # app rather than at a copy, so an upgrade replaces both at once.
+            app "Mimi.app"
+            binary "#{appdir}/Mimi.app/Contents/MacOS/mimi"
+
+            caveats <<~CAVEATS
+              mimi runs with its defaults and needs no configuration to start.
+              To change where recordings land or which applications trigger one,
+              write ~/.config/mimi/config.toml - see the README for the keys -
+              and check it with:
+
+                mimi --check-config
+
+              Then:
+
+                mimi install
+
+              That writes the launchd agent dev.pkarpovich.mimi and starts it.
+              An upgrade replaces the app in place and needs nothing further.
+
+              The first time a meeting starts, macOS asks for the microphone.
+              Granting it is what makes the recording carry your voice; without
+              it the left channel is silence and nothing else reports a problem.
+              The grant survives upgrades: the app is identified by its bundle
+              id at a path that does not move.
+
+              Recordings land in ~/Recordings/mimi and are never deleted by
+              mimi. Logs are at ~/Library/Logs/mimi.log and mimi.err.log.
+            CAVEATS
+
+            uninstall quit:      "dev.pkarpovich.mimi",
+                      launchctl: "dev.pkarpovich.mimi"
+
+            # Recordings are deliberately absent: zap removes what the app owns,
+            # and the meetings belong to whoever recorded them.
+            zap trash: [
+              "~/.config/mimi",
+              "~/Library/Logs/mimi.log",
+              "~/Library/Logs/mimi.err.log",
+            ]
+          end
+          EOF
+
+      - name: Commit and push
+        working-directory: tap
+        env:
+          VERSION: ${{ steps.facts.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "mimi ${VERSION}"
+          git push
