@@ -4,9 +4,10 @@ use std::io;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{SendError, Sender};
 
 use chrono::{DateTime, Local, SecondsFormat};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
@@ -32,6 +33,7 @@ pub struct Recording {
     pub started_at: DateTime<Local>,
     pub ended_at: DateTime<Local>,
     pub bundle_id: BundleId,
+    pub label: String,
     pub sample_rate: u32,
     pub channels: u32,
     pub device_changes: u32,
@@ -61,30 +63,38 @@ pub trait Sink {
 }
 
 /// LocalFolder completes a recording where it was written, next to its own bytes.
-pub struct LocalFolder;
+pub struct LocalFolder(Option<Sender<PathBuf>>);
+
+impl LocalFolder {
+    /// new builds the local sink, publishing every sidecar it writes when a hook is configured.
+    pub fn new(hook: Option<Sender<PathBuf>>) -> Self {
+        Self(hook)
+    }
+}
 
 impl Sink for LocalFolder {
     fn accept(&self, recording: Recording) -> Result<(), SinkError> {
-        let sidecar = sidecar(&recording);
+        let Self(hook) = self;
         let Recording {
             partial,
             started_at: _,
             ended_at: _,
             bundle_id: _,
+            label: _,
             sample_rate: _,
             channels: _,
             device_changes: _,
             failed_device_changes: _,
             verdict: _,
             written: _,
-        } = recording;
+        } = &recording;
 
-        let Some(completed) = completed_path(&partial) else {
-            return Err(SinkError::NotPartial(partial));
+        let Some(completed) = completed_path(partial) else {
+            return Err(SinkError::NotPartial(partial.clone()));
         };
-        if let Err(source) = fs::rename(&partial, &completed) {
+        if let Err(source) = fs::rename(partial, &completed) {
             return Err(SinkError::Rename {
-                path: partial,
+                path: partial.clone(),
                 source,
             });
         }
@@ -103,15 +113,17 @@ impl Sink for LocalFolder {
             }
         };
 
-        let described = match serde_json::to_vec_pretty(&sidecar) {
-            Ok(described) => described,
-            Err(source) => {
-                return Err(SinkError::Describe {
-                    path: completed,
-                    source,
-                });
-            }
-        };
+        let on_complete = hook.as_ref().map(|_| OnComplete::Pending);
+        let described =
+            match serde_json::to_vec_pretty(&sidecar(&recording, &completed, on_complete)) {
+                Ok(described) => described,
+                Err(source) => {
+                    return Err(SinkError::Describe {
+                        path: completed,
+                        source,
+                    });
+                }
+            };
         let completed = completed.with_extension(SIDECAR_EXTENSION);
         if let Err(source) = write_private(&completed, &described) {
             return Err(SinkError::Sidecar {
@@ -119,30 +131,50 @@ impl Sink for LocalFolder {
                 source,
             });
         }
+
+        let Some(hook) = hook else {
+            return Ok(());
+        };
+        if let Err(SendError(sidecar)) = hook.send(completed) {
+            warn!("{} did not reach the completion hook", sidecar.display());
+        }
         Ok(())
     }
 }
 
+/// OnComplete is how far the completion hook has got with the recording beside it.
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum OnComplete {
+    Pending,
+    Done { at: String },
+}
+
 #[derive(Debug, Serialize, PartialEq)]
 struct Sidecar {
+    file: String,
     started_at: String,
     ended_at: String,
     duration_seconds: i64,
     bundle_id: String,
+    label: String,
     sample_rate: u32,
     channels: u32,
     device_changes: u32,
     failed_device_changes: u32,
     silent: bool,
     write_failed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    on_complete: Option<OnComplete>,
 }
 
-fn sidecar(recording: &Recording) -> Sidecar {
+fn sidecar(recording: &Recording, completed: &Path, on_complete: Option<OnComplete>) -> Sidecar {
     let Recording {
         partial: _,
         started_at,
         ended_at,
         bundle_id,
+        label,
         sample_rate,
         channels,
         device_changes,
@@ -159,7 +191,12 @@ fn sidecar(recording: &Recording) -> Sidecar {
         Written::Failed => true,
         Written::Whole => false,
     };
+    let file = match completed.file_name() {
+        Some(file) => file.to_string_lossy().into_owned(),
+        None => String::new(),
+    };
     Sidecar {
+        file,
         started_at: started_at.to_rfc3339_opts(SecondsFormat::Secs, false),
         ended_at: ended_at.to_rfc3339_opts(SecondsFormat::Secs, false),
         duration_seconds: ended_at
@@ -167,12 +204,14 @@ fn sidecar(recording: &Recording) -> Sidecar {
             .num_seconds()
             .max(0),
         bundle_id: bundle_id.as_str().to_owned(),
+        label: label.clone(),
         sample_rate: *sample_rate,
         channels: *channels,
         device_changes: *device_changes,
         failed_device_changes: *failed_device_changes,
         silent,
         write_failed,
+        on_complete,
     }
 }
 
@@ -255,10 +294,13 @@ fn completed_path(partial: &Path) -> Option<PathBuf> {
 mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::mpsc;
 
     use chrono::TimeZone;
 
     use super::*;
+    use crate::capture::{BlockRef, Formats, ring};
+    use crate::writer::{self, Finished, WriterSettings};
 
     static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -297,12 +339,40 @@ mod tests {
             .expect("a local timestamp")
     }
 
+    fn encode(path: &Path) {
+        let formats = Formats::new();
+        formats.publish(1, 48_000.0);
+        let (producer, consumer) = ring(16, 2048);
+        let samples = vec![0.25; 2048];
+        for round in 0..8 {
+            producer.push(BlockRef {
+                microphone: &samples,
+                system: &samples,
+                frames: 2048,
+                host_time: round,
+                generation: 1,
+            });
+        }
+        let writer = writer::spawn(
+            WriterSettings {
+                path: path.to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict: _ } = writer.finish();
+        assert_eq!(error, None, "the test needs a real recording to remux");
+    }
+
     fn recording(partial: PathBuf) -> Recording {
         Recording {
             partial,
             started_at: started_at(),
             ended_at: started_at() + chrono::Duration::seconds(1830),
             bundle_id: BundleId::new("company.thebrowser.browser.helper"),
+            label: "thebrowser".to_owned(),
             sample_rate: 24_000,
             channels: 2,
             device_changes: 1,
@@ -410,9 +480,14 @@ mod tests {
 
     #[test]
     fn a_sidecar_carries_every_documented_field() {
-        let described =
-            serde_json::to_value(sidecar(&recording(PathBuf::from("/tmp/x.aac.partial"))))
-                .expect("serialize the sidecar");
+        let described = serde_json::to_value(sidecar(
+            &recording(PathBuf::from("/tmp/x.aac.partial")),
+            Path::new("/tmp/2026-08-30T14-32-05-thebrowser.m4a"),
+            None,
+        ))
+        .expect("serialize the sidecar");
+        assert_eq!(described["file"], "2026-08-30T14-32-05-thebrowser.m4a");
+        assert_eq!(described["label"], "thebrowser");
         assert_eq!(
             described["started_at"],
             started_at().to_rfc3339_opts(SecondsFormat::Secs, false)
@@ -430,20 +505,56 @@ mod tests {
         assert_eq!(described["failed_device_changes"], 0);
         assert_eq!(described["silent"], false);
         assert_eq!(described["write_failed"], false);
+        assert_eq!(described.get("on_complete"), None);
         assert_eq!(
             described.as_object().expect("an object").len(),
-            10,
+            12,
             "the sidecar carries no field the plan does not document"
         );
+    }
+
+    #[test]
+    fn a_sidecar_written_under_a_hook_starts_out_pending() {
+        let described = serde_json::to_value(sidecar(
+            &recording(PathBuf::from("/tmp/x.aac.partial")),
+            Path::new("/tmp/2026-08-30T14-32-05-thebrowser.m4a"),
+            Some(OnComplete::Pending),
+        ))
+        .expect("serialize the sidecar");
+        assert_eq!(
+            described["on_complete"],
+            serde_json::json!({"state": "pending"})
+        );
+        assert_eq!(
+            described.as_object().expect("an object").len(),
+            13,
+            "the hook adds one field and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_delivery_state_survives_a_round_trip_through_json() {
+        for state in [
+            OnComplete::Pending,
+            OnComplete::Done {
+                at: "2026-09-02T16:21:03+02:00".to_owned(),
+            },
+        ] {
+            let described = serde_json::to_string(&state).expect("serialize the state");
+            assert_eq!(
+                serde_json::from_str::<OnComplete>(&described).expect("read the state back"),
+                state
+            );
+        }
     }
 
     #[test]
     fn a_silent_verdict_marks_the_sidecar_and_an_undecided_one_does_not() {
         let mut recording = recording(PathBuf::from("/tmp/x.aac.partial"));
         recording.verdict = Verdict::Silent;
-        assert!(sidecar(&recording).silent);
+        assert!(sidecar(&recording, Path::new("/tmp/x.m4a"), None).silent);
         recording.verdict = Verdict::Undecided;
-        assert!(!sidecar(&recording).silent);
+        assert!(!sidecar(&recording, Path::new("/tmp/x.m4a"), None).silent);
     }
 
     #[test]
@@ -451,7 +562,7 @@ mod tests {
         let mut recording = recording(PathBuf::from("/tmp/x.aac.partial"));
         recording.written = Written::Failed;
         assert!(
-            sidecar(&recording).write_failed,
+            sidecar(&recording, Path::new("/tmp/x.m4a"), None).write_failed,
             "a file the writer abandoned part way must not look complete"
         );
     }
@@ -463,7 +574,7 @@ mod tests {
         let partial = partial_path(dir.path(), &stem);
         fs::write(&partial, b"adts").expect("write the partial file");
 
-        LocalFolder
+        LocalFolder::new(None)
             .accept(recording(partial.clone()))
             .expect("accept the recording");
 
@@ -477,6 +588,11 @@ mod tests {
             serde_json::from_str(&described).expect("valid sidecar json");
         assert_eq!(described["duration_seconds"], 1830);
         assert_eq!(described["device_changes"], 1);
+        assert_eq!(
+            described["file"],
+            format!("{stem}.aac"),
+            "a recording the remux left alone is named as the aac it stayed"
+        );
 
         let mode = fs::metadata(&sidecar)
             .expect("the sidecar")
@@ -490,11 +606,78 @@ mod tests {
     }
 
     #[test]
+    fn a_remuxed_recording_is_named_by_the_m4a_that_replaced_it() {
+        let dir = TempDir::new();
+        let stem = file_stem(started_at(), "thebrowser");
+        let partial = partial_path(dir.path(), &stem);
+        encode(&partial);
+
+        LocalFolder::new(None)
+            .accept(recording(partial))
+            .expect("accept the recording");
+
+        let described = fs::read_to_string(dir.path().join(format!("{stem}.json")))
+            .expect("the sidecar beside it");
+        let described: serde_json::Value =
+            serde_json::from_str(&described).expect("valid sidecar json");
+        assert_eq!(described["file"], format!("{stem}.m4a"));
+        assert!(
+            dir.path().join(format!("{stem}.m4a")).exists(),
+            "the sidecar must name a file that is on disk"
+        );
+    }
+
+    #[test]
+    fn a_hooked_sink_marks_the_sidecar_pending_and_hands_over_its_path() {
+        let dir = TempDir::new();
+        let stem = file_stem(started_at(), "thebrowser");
+        let partial = partial_path(dir.path(), &stem);
+        fs::write(&partial, b"adts").expect("write the partial file");
+
+        let (hook, delivered) = mpsc::channel();
+        LocalFolder::new(Some(hook))
+            .accept(recording(partial))
+            .expect("accept the recording");
+
+        let sidecar = dir.path().join(format!("{stem}.json"));
+        assert_eq!(
+            delivered
+                .try_recv()
+                .expect("the hook was handed the sidecar"),
+            sidecar
+        );
+        let described = fs::read_to_string(&sidecar).expect("the sidecar beside it");
+        let described: serde_json::Value =
+            serde_json::from_str(&described).expect("valid sidecar json");
+        assert_eq!(
+            described["on_complete"],
+            serde_json::json!({"state": "pending"}),
+            "a recording is pending from the moment its sidecar exists"
+        );
+    }
+
+    #[test]
+    fn a_hook_that_is_gone_does_not_fail_the_recording() {
+        let dir = TempDir::new();
+        let stem = file_stem(started_at(), "thebrowser");
+        let partial = partial_path(dir.path(), &stem);
+        fs::write(&partial, b"adts").expect("write the partial file");
+
+        let (hook, delivered) = mpsc::channel();
+        drop(delivered);
+        LocalFolder::new(Some(hook))
+            .accept(recording(partial))
+            .expect("a hook thread that ended must not lose the recording");
+
+        assert!(dir.path().join(format!("{stem}.json")).exists());
+    }
+
+    #[test]
     fn a_path_without_the_partial_suffix_is_refused() {
         let dir = TempDir::new();
         let completed = dir.path().join("2026-08-30T14-32-05-zoom.aac");
         fs::write(&completed, b"adts").expect("write the file");
-        let failure = LocalFolder
+        let failure = LocalFolder::new(None)
             .accept(recording(completed.clone()))
             .expect_err("a completed file is not an in-progress recording");
         match failure {
@@ -509,7 +692,7 @@ mod tests {
     fn a_missing_partial_file_is_reported_as_a_rename_failure() {
         let dir = TempDir::new();
         let partial = partial_path(dir.path(), "2026-08-30T14-32-05-zoom");
-        let failure = LocalFolder
+        let failure = LocalFolder::new(None)
             .accept(recording(partial.clone()))
             .expect_err("nothing to rename");
         match failure {

@@ -195,7 +195,7 @@ fn run() -> ExitCode {
         },
         devices,
         &mut capture,
-        &LocalFolder,
+        &LocalFolder::new(None),
         incoming,
         &shutdown,
     );

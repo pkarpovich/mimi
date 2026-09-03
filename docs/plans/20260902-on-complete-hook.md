@@ -208,12 +208,14 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 - Modify: `src/session/mod.rs`
 - Modify: `src/main.rs`
 
-- [ ] add `label: String` to `Recording` and to `Session`, filled from `SessionStart` in `start_session` and passed on in `finish_session`; update the session tests' `Recording` destructuring and `FakeSink` usage
-- [ ] add `OnComplete` (tagged enum, `Serialize` and `Deserialize`) and the `file`, `label`, `on_complete` fields to `Sidecar`; `sidecar()` takes the completed audio path to fill `file`
-- [ ] turn `LocalFolder` into a struct holding `Option<Sender<PathBuf>>` with `LocalFolder::new`; when the sender is present the sidecar is written with `Pending` and its path is sent afterwards; a send error is a warn, not an `accept` failure
-- [ ] switch `main.rs` to `LocalFolder::new(None)` so the crate compiles and behaves as before
-- [ ] write tests: a sidecar without a hook has exactly twelve fields and no `on_complete`; with a hook it has thirteen and `{"state": "pending"}`; `file` is the m4a name after a successful remux and the aac name when the remux is skipped; `label` is carried; `accept` delivers the sidecar path on the channel; a dropped receiver does not fail `accept`; `OnComplete` round-trips both variants through serde_json
-- [ ] run `mise run check` - must pass before task 3
+- [x] add `label: String` to `Recording` and to `Session`, filled from `SessionStart` in `start_session` and passed on in `finish_session`; update the session tests' `Recording` destructuring and `FakeSink` usage
+- [x] add `OnComplete` (tagged enum, `Serialize` and `Deserialize`) and the `file`, `label`, `on_complete` fields to `Sidecar`; `sidecar()` takes the completed audio path to fill `file`
+- [x] turn `LocalFolder` into a struct holding `Option<Sender<PathBuf>>` with `LocalFolder::new`; when the sender is present the sidecar is written with `Pending` and its path is sent afterwards; a send error is a warn, not an `accept` failure
+- [x] switch `main.rs` to `LocalFolder::new(None)` so the crate compiles and behaves as before
+- [x] write tests: a sidecar without a hook has exactly twelve fields and no `on_complete`; with a hook it has thirteen and `{"state": "pending"}`; `file` is the m4a name after a successful remux and the aac name when the remux is skipped; `label` is carried; `accept` delivers the sidecar path on the channel; a dropped receiver does not fail `accept`; `OnComplete` round-trips both variants through serde_json
+- [x] run `mise run check` - must pass before task 3
+- + the m4a-name test encodes a real ADTS file through `writer::spawn` first, because `remux::to_m4a` only succeeds on audio Core Audio can read
+- + `on_complete` is built with `hook.as_ref().map(...)` rather than a `match`: clippy's `manual_map` is denied by `-D warnings`
 
 ### Task 3: Running one hook: `ShellRunner` and the process-group kill
 
