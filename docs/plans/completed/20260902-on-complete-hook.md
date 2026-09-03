@@ -292,9 +292,10 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 - Modify: `README.md`
 - Modify: `CLAUDE.md`
 
-- [ ] README: add `on_complete` and `on_complete_timeout_seconds` to the configuration table; add a "Completion hook" section stating the contract from Technical Details (invocation, environment, exit codes, retry and backoff, the `on_complete` sidecar field, the startup scan, the idempotency requirement, the launchd environment note); extend the sidecar example with `file`, `label` and `on_complete`
-- [ ] CLAUDE.md: add `src/hook.rs` to the module layout; add a "Completion hook" section carrying the reasoning that must not become comments: why stdio is inherited rather than piped, why the child runs in its own process group and is killed through `macos::kill_process_group`, why the pending mark is written in the same write as the sidecar, and why the scan looks at `pending` only
-- [ ] move this plan to `docs/plans/completed/`
+- [x] README: add `on_complete` and `on_complete_timeout_seconds` to the configuration table; add a "Completion hook" section stating the contract from Technical Details (invocation, environment, exit codes, retry and backoff, the `on_complete` sidecar field, the startup scan, the idempotency requirement, the launchd environment note); extend the sidecar example with `file`, `label` and `on_complete`
+- [x] CLAUDE.md: add `src/hook.rs` to the module layout; add a "Completion hook" section carrying the reasoning that must not become comments: why stdio is inherited rather than piped, why the child runs in its own process group and is killed through `macos::kill_process_group`, why the pending mark is written in the same write as the sidecar, and why the scan looks at `pending` only
+- [x] move this plan to `docs/plans/completed/`
+- + the README file table gained the `.m4a` row: it listed only the `.aac` while `LocalFolder::accept` has been remuxing and removing it for some time, and the hook contract names both extensions - a sidecar example carrying `"file": "...m4a"` beside a table that never mentions one would document a file that appears out of nowhere
 
 ## Post-Completion
 

@@ -21,6 +21,7 @@ src/capture/silence.rs  pure all-zero detection over a window
 src/capture/devices.rs  pure rebuild decision over devices and rate
 src/writer.rs           ExtAudioFile ADTS AAC writer, stereo fold, resampling        (unsafe)
 src/sink.rs             Sink trait, local-folder implementation, sidecar JSON
+src/hook.rs             completion-hook thread: sidecar ledger, shell run, retry
 src/service.rs          launchd agent install/uninstall
 src/macos/mod.rs        raw Core Audio property helpers                              (unsafe)
 ```
@@ -98,6 +99,20 @@ The IOProc runs on a real-time thread and must not allocate, lock, block or touc
 ## The two-track seam
 
 Microphone and system audio stay separate concepts from the IOProc all the way to the writer. The ring carries them apart. They are folded into interleaved stereo in exactly one place, `writer::fold`: left is the microphone, right is the system mixdown, and when the microphone track is absent its channel is silence rather than a copy of the system track.
+
+## The completion hook delivers from the sidecar, not from memory
+
+`on_complete` is one shell command run for every recording that completes while it is configured, until a run exits 0. The command is opaque; what mimi owes it is delivery, and the reasoning behind how that delivery is arranged is here rather than in comments.
+
+**The sidecar is the only state.** There is no queue file, no marker file, no in-memory list that has to survive anything. `LocalFolder::accept` writes `"on_complete": {"state": "pending"}` in the same write that creates the sidecar - not a second write afterwards - so no completed recording ever exists on disk without its pending mark, and a `kill -9` between the two writes is a window that does not exist. The hook thread rewrites the field to `done` with an `at` after the run that succeeded, through a `<sidecar>.tmp` at mode 0600 and a rename, so a crash mid-rewrite leaves the sidecar as it was: still pending, delivered again later. That is why the command has to be idempotent - a hook that exited 0 and then lost the rewrite is run again at the next start.
+
+**The startup scan looks at `pending` only.** A sidecar with no `on_complete` field is not the hook's business: it was written before the hook was configured, and enabling a hook must not publish the archive retroactively. `Ledger.file` is `Option<String>` for the same reason - a sidecar from before this feature carries no `file` either, and it has to be passed over silently rather than warned about as unparsable. The two cases that do warn are a sidecar that will not parse at all and a pending one whose audio is gone.
+
+**The child inherits stdout and stderr; it is never piped.** A pipe would have to be drained by the same thread that is enforcing the timeout, and a child that fills the pipe buffer while that thread is sleeping between `try_wait` polls is a deadlock. Inheriting the daemon's streams keeps the thread free of reading, and under launchd the command's output lands in the same log as mimi's own.
+
+**The child is its own process group and is killed as one.** `Command::process_group(0)` makes it the group leader, and on the timeout - or on shutdown - `macos::kill_process_group` sends `SIGKILL` to the group, then the child is reaped. Killing the `sh` alone would leave whatever it spawned running, so the test that covers the timeout runs `sleep 31337 & sleep 31337` and asserts through `pgrep` that neither process is left behind. The wrapper lives in `src/macos/mod.rs` next to `user_id()` so `src/hook.rs` stays free of `unsafe`.
+
+**Shutdown drops the queue, not the work.** `ShellRunner` watches the same `Shutdown` flag inside its poll loop, so the join in `main` is bounded by one 200 ms tick rather than by `on_complete_timeout_seconds`. Nothing is flushed on the way out: every job that was not marked done is still `pending` on disk, and the next start's scan finds it.
 
 ## Code style
 

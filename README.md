@@ -45,6 +45,7 @@ Everything goes into `output_dir` (default `~/Recordings/mimi`). For a session t
 |---|---|
 | `2026-08-30T14-32-05-thebrowser.aac.partial` | while recording |
 | `2026-08-30T14-32-05-thebrowser.aac` | renamed in place at completion |
+| `2026-08-30T14-32-05-thebrowser.m4a` | remuxed from it at completion; the `.aac` is removed once it exists, and kept instead when the remux fails |
 | `2026-08-30T14-32-05-thebrowser.json` | written at completion |
 
 The label comes from the allow-list prefix that matched: lowercased, trailing dot removed, reduced to its last dotted component. `company.thebrowser.` becomes `thebrowser`, `us.zoom.` becomes `zoom`, `com.google.Chrome` becomes `chrome`. A name that is already taken gets a numeric suffix rather than overwriting anything: the in-progress file is created at the moment the name is chosen, so a second recorder walking the same names in the same second is handed the next suffix rather than the file this one is about to write.
@@ -55,18 +56,23 @@ The sidecar:
 
 ```json
 {
+  "file": "2026-08-30T14-32-05-thebrowser.m4a",
   "started_at": "2026-08-30T14:32:05+02:00",
   "ended_at": "2026-08-30T15:04:11+02:00",
   "duration_seconds": 1926,
   "bundle_id": "company.thebrowser.browser.helper",
+  "label": "thebrowser",
   "sample_rate": 24000,
   "channels": 2,
   "device_changes": 1,
   "failed_device_changes": 0,
   "silent": false,
-  "write_failed": false
+  "write_failed": false,
+  "on_complete": {"state": "pending"}
 }
 ```
+
+`file` names the audio the sidecar describes, `label` is the allow-list label the name was built from, and `on_complete` is the completion hook's delivery state - present only when a hook was configured while the recording completed.
 
 `device_changes` counts the rebuilds that succeeded, `failed_device_changes` the ones that exhausted their retries - a recording whose capture never came back says so, once per outage rather than once per retry. `silent` is the verdict of the silence check, which watches the opening seconds of the recording and restarts on every rebuild; an opening that was judged silent stays reported for the rest of the session, whatever a later rebuild heard. The check exists because a capture that turns into digital silence is otherwise invisible: callbacks keep firing, counters stay healthy, and the file is empty. `write_failed` says the writer gave up before the session ended - the file holds everything up to that point and nothing after it.
 
@@ -82,6 +88,8 @@ The sidecar:
 | `bit_rate` | integer | `96000` | AAC bit rate in bits per second, between 8000 and 320000 |
 | `stop_grace_seconds` | integer | `15` | how long the microphone must stay released before a session closes |
 | `poll_interval_ms` | integer | `1000` | how often the microphone holders are sampled |
+| `on_complete` | string | unset | a shell command run once for every recording that completes while it is configured; absent means no hook, blank is a startup error |
+| `on_complete_timeout_seconds` | integer | `120` | how long one run of that command may take before its process group is killed |
 
 Print the effective configuration and exit:
 
@@ -90,6 +98,37 @@ mimi --check-config
 ```
 
 It exits non-zero and names the reason when the file cannot be used.
+
+## Completion hook
+
+With `on_complete` set, every recording that completes is handed to that command until one run of it exits 0. mimi knows nothing about what the command does - uploading, transcribing, enqueuing - it only guarantees the hand-over.
+
+```toml
+on_complete = "/usr/local/bin/publish-recording"
+on_complete_timeout_seconds = 120
+```
+
+The contract:
+
+- The command runs as `/bin/sh -c <on_complete>`, with `output_dir` as the working directory and in
+its own process group. stdin is `/dev/null`; stdout and stderr are the daemon's own, so under the LaunchAgent whatever the command prints lands in `~/Library/Logs/mimi.err.log` next to mimi's own events.
+- It gets the daemon's environment plus `MIMI_RECORDING`, the absolute path of the completed audio
+(the `.m4a`, or the `.aac` when the remux failed and the ADTS file was kept), and `MIMI_SIDECAR`, the absolute path of its sidecar. Everything else about the recording is in that sidecar.
+- **Exit 0 means delivered.** The sidecar is marked done and the command is never run again for that
+recording. Any other exit, a signal, a failure to start, or outliving `on_complete_timeout_seconds` means the recording is still owed and is retried; on the timeout the whole process group is killed, so a command that spawned children does not leave them behind.
+- Retries back off: 60 seconds after the first failure, doubling, capped at 30 minutes. One run at a
+time, in order of completion. A hook that keeps failing never delays a recording - completion hands the sidecar over and the run loop goes straight back to watching the microphone.
+
+Delivery state lives in the sidecar and nowhere else. A recording that completes under a configured hook carries `"on_complete": {"state": "pending"}` from the moment its sidecar is written, and `{"state": "done", "at": "2026-08-30T15:04:19+02:00"}` after the run that exited 0. At every start mimi scans `output_dir` for sidecars still `pending` and queues them oldest first, so a recording survives a hook that never succeeded, a daemon that was stopped, and a reboot.
+
+Two consequences worth knowing:
+
+- **The command must be idempotent.** A run that exited 0 in the window between the child's exit and
+the sidecar rewrite - a `kill -9` landing exactly there - is run again at the next start.
+- **Nothing is published retroactively.** Sidecars written before the hook was configured carry no
+`on_complete` field and are never touched, so turning the hook on does not replay the archive. With `on_complete` unset, every file mimi writes is what it wrote before the hook existed.
+
+Under launchd the environment is minimal - `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin` - so a command that needs anything else has to name it by absolute path or set it up itself.
 
 ## Install
 
