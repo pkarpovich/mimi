@@ -111,13 +111,15 @@ on_complete_timeout_seconds = 120
 The contract:
 
 - The command runs as `/bin/sh -c <on_complete>`, with `output_dir` as the working directory and in
-its own process group. stdin is `/dev/null`; stdout and stderr are the daemon's own, so under the LaunchAgent whatever the command prints lands in `~/Library/Logs/mimi.err.log` next to mimi's own events.
+its own process group. stdin is `/dev/null`; stdout and stderr are the daemon's own, so under the LaunchAgent the command's stderr lands in `~/Library/Logs/mimi.err.log` next to mimi's own events, and its stdout in `~/Library/Logs/mimi.log`.
 - It gets the daemon's environment plus `MIMI_RECORDING`, the absolute path of the completed audio
 (the `.m4a`, or the `.aac` when the remux failed and the ADTS file was kept), and `MIMI_SIDECAR`, the absolute path of its sidecar. Everything else about the recording is in that sidecar.
 - **Exit 0 means delivered.** The sidecar is marked done and the command is never run again for that
 recording. Any other exit, a signal, a failure to start, or outliving `on_complete_timeout_seconds` means the recording is still owed and is retried; on the timeout the whole process group is killed, so a command that spawned children does not leave them behind.
 - Retries back off: 60 seconds after the first failure, doubling, capped at 30 minutes. One run at a
-time, in order of completion. A hook that keeps failing never delays a recording - completion hands the sidecar over and the run loop goes straight back to watching the microphone.
+time, in order of completion. A hook that keeps failing never delays a recording - completion hands the sidecar over and the run loop goes straight back to watching the microphone, and a recording waiting out its backoff does not hold up the ones behind it.
+- **A stopping daemon does not wait for the command.** Ctrl-C, `launchctl` stop or an upgrade kills
+the in-flight run's process group the same way the timeout does, and nothing is flushed on the way out: the recording stays `pending` and the next start hands it over again.
 
 Delivery state lives in the sidecar and nowhere else. A recording that completes under a configured hook carries `"on_complete": {"state": "pending"}` from the moment its sidecar is written, and `{"state": "done", "at": "2026-08-30T15:04:19+02:00"}` after the run that exited 0. At every start mimi scans `output_dir` for sidecars still `pending` and queues them oldest first, so a recording survives a hook that never succeeded, a daemon that was stopped, and a reboot.
 
@@ -126,7 +128,7 @@ Two consequences worth knowing:
 - **The command must be idempotent.** A run that exited 0 in the window between the child's exit and
 the sidecar rewrite - a `kill -9` landing exactly there - is run again at the next start.
 - **Nothing is published retroactively.** Sidecars written before the hook was configured carry no
-`on_complete` field and are never touched, so turning the hook on does not replay the archive. With `on_complete` unset, every file mimi writes is what it wrote before the hook existed.
+`on_complete` field and are never touched, so turning the hook on does not replay the archive. With `on_complete` unset no `on_complete` field is written at all - though every sidecar carries `file` and `label` either way.
 
 Under launchd the environment is minimal - `PATH` is `/usr/bin:/bin:/usr/sbin:/sbin` - so a command that needs anything else has to name it by absolute path or set it up itself.
 
@@ -179,7 +181,7 @@ Grant whatever macOS prompts for on the first recorded session. If no prompt app
 
 ## Logs
 
-Every event goes to stderr, so under the LaunchAgent the file to read is `~/Library/Logs/mimi.err.log`. `~/Library/Logs/mimi.log` is the agent's `StandardOutPath` and stays empty. mimi logs its version at startup, then one event per session start, session end, device rebuild, rebuild failure, silence verdict and dropped ring blocks. `mimi --version` (or `-V`) prints the same version, which is what tells you whether an upgrade actually took.
+Every event goes to stderr, so under the LaunchAgent the file to read is `~/Library/Logs/mimi.err.log`. `~/Library/Logs/mimi.log` is the agent's `StandardOutPath` and stays empty unless a completion-hook command writes to stdout. mimi logs its version at startup, then one event per session start, session end, device rebuild, rebuild failure, silence verdict and dropped ring blocks - and, with a hook configured, one per delivered recording and one per run that left a recording undelivered, naming why. `mimi --version` (or `-V`) prints the same version, which is what tells you whether an upgrade actually took.
 
 ## Development
 

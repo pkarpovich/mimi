@@ -138,7 +138,10 @@ impl Sink for LocalFolder {
             return Ok(());
         };
         if let Err(SendError(sidecar)) = hook.send(completed) {
-            warn!("{} did not reach the completion hook", sidecar.display());
+            info!(
+                "{} stays pending for the next start: the completion hook has stopped",
+                sidecar.display()
+            );
         }
         Ok(())
     }
@@ -266,7 +269,8 @@ pub fn write_private(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
         .truncate(true)
         .mode(RECORDING_MODE)
         .open(path)?;
-    file.write_all(contents)
+    file.write_all(contents)?;
+    file.sync_all()
 }
 
 fn finished(dir: &Path, stem: &str) -> bool {

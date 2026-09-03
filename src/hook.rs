@@ -204,6 +204,7 @@ pub fn job_for(sidecar: &Path) -> Option<Job> {
 pub fn scan(dir: &Path) -> Vec<Job> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
+        Err(source) if source.kind() == io::ErrorKind::NotFound => return Vec::new(),
         Err(source) => {
             warn!(
                 "{} could not be read for pending recordings: {source}",
@@ -543,6 +544,10 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::activity::BundleId;
+    use crate::capture::Verdict;
+    use crate::sink::{LocalFolder, Recording, Sink, file_stem};
+    use crate::writer::Written;
 
     static NEXT_DIR: AtomicU32 = AtomicU32::new(0);
 
@@ -566,7 +571,8 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let Self(path) = self;
-            let _ = fs::remove_dir_all(path);
+            let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o700));
+            let _ = fs::remove_dir_all(&path);
         }
     }
 
@@ -644,10 +650,16 @@ mod tests {
                 .arg(command)
                 .output()
                 .expect("pgrep");
-            if !found.status.success() {
-                return false;
+            if found.status.success() {
+                thread::sleep(Duration::from_millis(50));
+                continue;
             }
-            thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                found.status.code(),
+                Some(1),
+                "pgrep itself failed, so it says nothing about the process group"
+            );
+            return false;
         }
         true
     }
@@ -876,6 +888,82 @@ mod tests {
             None,
             "a delivered recording is never handed to the command again"
         );
+    }
+
+    fn keys(described: &serde_json::Value) -> Vec<String> {
+        let mut keys = Vec::new();
+        for (key, _) in described.as_object().expect("an object") {
+            keys.push(key.clone());
+        }
+        keys
+    }
+
+    #[test]
+    fn a_sidecar_the_sink_wrote_is_the_job_the_hook_delivers() {
+        let dir = TempDir::new();
+        let stem = file_stem(delivered_at(), "thebrowser");
+        let partial = dir.path().join(format!("{stem}.aac.partial"));
+        fs::write(&partial, b"adts").expect("write the partial file");
+
+        let (sender, sidecars) = mpsc::channel();
+        LocalFolder::new(Some(sender))
+            .accept(Recording {
+                partial,
+                started_at: delivered_at(),
+                ended_at: delivered_at() + chrono::Duration::seconds(1830),
+                bundle_id: BundleId::new("company.thebrowser.browser.helper"),
+                label: "thebrowser".to_owned(),
+                sample_rate: 24_000,
+                channels: 2,
+                device_changes: 1,
+                failed_device_changes: 0,
+                verdict: Verdict::AudioPresent,
+                written: Written::Whole,
+            })
+            .expect("accept the recording");
+
+        let sidecar = sidecars
+            .try_recv()
+            .expect("the sink handed the sidecar over");
+        assert_eq!(
+            scan(dir.path()),
+            vec![Job {
+                sidecar: sidecar.clone(),
+                recording: dir.path().join(format!("{stem}.aac")),
+            }],
+            "the hook picks up exactly what the sink wrote"
+        );
+
+        let before = fs::read(&sidecar).expect("the sidecar");
+        let before: serde_json::Value =
+            serde_json::from_slice(&before).expect("valid sidecar json");
+        mark_done(&sidecar, delivered_at()).expect("mark the sidecar done");
+        let after = fs::read(&sidecar).expect("the sidecar");
+        let after: serde_json::Value = serde_json::from_slice(&after).expect("valid sidecar json");
+
+        assert_eq!(
+            keys(&after),
+            keys(&before),
+            "a delivery leaves the sidecar's shape alone"
+        );
+        for (key, value) in before.as_object().expect("an object") {
+            if key == ON_COMPLETE_FIELD {
+                continue;
+            }
+            assert_eq!(
+                after.get(key),
+                Some(value),
+                "{key} did not survive the delivery"
+            );
+        }
+        assert_eq!(
+            after[ON_COMPLETE_FIELD],
+            serde_json::json!({
+                "state": "done",
+                "at": delivered_at().to_rfc3339_opts(SecondsFormat::Secs, false),
+            })
+        );
+        assert_eq!(job_for(&sidecar), None);
     }
 
     #[test]
@@ -1131,6 +1219,75 @@ mod tests {
     }
 
     #[test]
+    fn a_recording_waiting_out_its_backoff_does_not_hold_up_a_newer_one() {
+        let dir = TempDir::new();
+        let stuck = recorded(dir.path(), "2026-09-02T09-00-00-early");
+        let (sender, receiver) = mpsc::channel();
+        let runner = FakeRunner::new(vec![Outcome::Failed(Failure::Exited(1))]);
+        let clock = FakeClock::new();
+        let shutdown = Shutdown::new();
+
+        let ran = runner.clone();
+        let ticking = clock.clone();
+        let raised = shutdown.clone();
+        let settings = settings(dir.path());
+        let thread =
+            thread::spawn(move || run(settings, receiver, shutdown, runner, move || ticking.now()));
+
+        eventually("the pending recording was never run", || {
+            ran.ran().len() == 1
+        });
+
+        let live = recorded(dir.path(), "2026-09-02T11-00-00-late");
+        sender.send(live.clone()).expect("hand over the sidecar");
+
+        eventually(
+            "a newer recording waited out somebody else's backoff",
+            || delivered(&live),
+        );
+        assert!(
+            !delivered(&stuck),
+            "the failing recording is still owed, and its wait was not cut short"
+        );
+        raised.request();
+        thread.join().expect("the hook thread");
+        drop(sender);
+    }
+
+    #[test]
+    fn a_sidecar_that_is_already_queued_is_not_queued_again() {
+        let dir = TempDir::new();
+        let sidecar = recorded(dir.path(), "2026-09-02T09-00-00-early");
+        let (sender, receiver) = mpsc::channel();
+        let runner = FakeRunner::new(vec![Outcome::Failed(Failure::Exited(1))]);
+        let clock = FakeClock::new();
+        let shutdown = Shutdown::new();
+
+        let ran = runner.clone();
+        let ticking = clock.clone();
+        let raised = shutdown.clone();
+        let settings = settings(dir.path());
+        let thread =
+            thread::spawn(move || run(settings, receiver, shutdown, runner, move || ticking.now()));
+
+        eventually("the pending recording was never run", || {
+            ran.ran().len() == 1
+        });
+        sender.send(sidecar.clone()).expect("hand over the sidecar");
+        thread::sleep(2 * POLL_INTERVAL);
+
+        assert_eq!(
+            ran.ran().len(),
+            1,
+            "a recording the scan already queued must not be run a second time when it arrives on the channel"
+        );
+        assert!(!delivered(&sidecar));
+        raised.request();
+        thread.join().expect("the hook thread");
+        drop(sender);
+    }
+
+    #[test]
     fn a_raised_shutdown_leaves_an_undelivered_recording_pending() {
         let dir = TempDir::new();
         let sidecar = recorded(dir.path(), "2026-09-02T09-00-00-early");
@@ -1206,6 +1363,10 @@ mod tests {
         });
         raised.request();
         thread.join().expect("the hook thread");
+        assert!(
+            !delivered(&sidecar),
+            "a delivery mimi could not record must not look delivered"
+        );
 
         let opened = fs::Permissions::from_mode(0o700);
         fs::set_permissions(dir.path(), opened).expect("open the output directory");

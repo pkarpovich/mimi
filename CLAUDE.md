@@ -20,10 +20,13 @@ src/capture/ring.rs     lock-free hand-off from the IOProc to the writer thread
 src/capture/silence.rs  pure all-zero detection over a window
 src/capture/devices.rs  pure rebuild decision over devices and rate
 src/writer.rs           ExtAudioFile ADTS AAC writer, stereo fold, resampling        (unsafe)
+src/remux.rs            ADTS -> m4a packet copy at completion
 src/sink.rs             Sink trait, local-folder implementation, sidecar JSON
 src/hook.rs             completion-hook thread: sidecar ledger, shell run, retry
 src/service.rs          launchd agent install/uninstall
+src/instance.rs         the advisory single-instance lock
 src/macos/mod.rs        raw Core Audio property helpers                              (unsafe)
+src/macos/audiofile.rs  AudioFile open/create/packet copy for the remux              (unsafe)
 ```
 
 ## Unsafe containment
@@ -104,11 +107,11 @@ Microphone and system audio stay separate concepts from the IOProc all the way t
 
 `on_complete` is one shell command run for every recording that completes while it is configured, until a run exits 0. The command is opaque; what mimi owes it is delivery, and the reasoning behind how that delivery is arranged is here rather than in comments.
 
-**The sidecar is the only state.** There is no queue file, no marker file, no in-memory list that has to survive anything. `LocalFolder::accept` writes `"on_complete": {"state": "pending"}` in the same write that creates the sidecar - not a second write afterwards - so no completed recording ever exists on disk without its pending mark, and a `kill -9` between the two writes is a window that does not exist. The hook thread rewrites the field to `done` with an `at` after the run that succeeded, through a `<sidecar>.tmp` at mode 0600 and a rename, so a crash mid-rewrite leaves the sidecar as it was: still pending, delivered again later. That is why the command has to be idempotent - a hook that exited 0 and then lost the rewrite is run again at the next start.
+**The sidecar is the only state.** There is no queue file, no marker file, no in-memory list that has to survive anything. `LocalFolder::accept` writes `"on_complete": {"state": "pending"}` in the same write that creates the sidecar - not a second write afterwards - so no completed recording ever exists on disk without its pending mark, and a `kill -9` between the two writes is a window that does not exist. The hook thread rewrites the field to `done` with an `at` after the run that succeeded, through a `<sidecar>.tmp` at mode 0600 and a rename, so a crash mid-rewrite leaves the sidecar as it was: still pending, delivered again later. `write_private` fsyncs before it returns, so the rename cannot publish a name whose contents never reached the disk. That is why the command has to be idempotent - a hook that exited 0 and then lost the rewrite is run again at the next start.
 
-**The startup scan looks at `pending` only.** A sidecar with no `on_complete` field is not the hook's business: it was written before the hook was configured, and enabling a hook must not publish the archive retroactively. `Ledger.file` is `Option<String>` for the same reason - a sidecar from before this feature carries no `file` either, and it has to be passed over silently rather than warned about as unparsable. The two cases that do warn are a sidecar that will not parse at all and a pending one whose audio is gone.
+**The startup scan looks at `pending` only.** A sidecar with no `on_complete` field is not the hook's business: it was written before the hook was configured, and enabling a hook must not publish the archive retroactively. `Ledger.file` is `Option<String>` for the same reason - a sidecar from before this feature carries no `file` either, and it has to be passed over silently rather than warned about as unparsable. The cases that do warn are a sidecar that cannot be read or parsed at all, and a pending one that names no recording or whose audio is gone. An `output_dir` that does not exist yet is not one of them: `session::start_session` creates it on the first meeting, and the hook thread is spawned before that, so `scan` treats `NotFound` as an empty directory rather than warning on every start until the first recording exists.
 
-**The child inherits stdout and stderr; it is never piped.** A pipe would have to be drained by the same thread that is enforcing the timeout, and a child that fills the pipe buffer while that thread is sleeping between `try_wait` polls is a deadlock. Inheriting the daemon's streams keeps the thread free of reading, and under launchd the command's output lands in the same log as mimi's own.
+**The child inherits stdout and stderr; it is never piped.** A pipe would have to be drained by the same thread that is enforcing the timeout, and a child that fills the pipe buffer while that thread is sleeping between `try_wait` polls is a deadlock. Inheriting the daemon's streams keeps the thread free of reading, and under launchd the command's stderr lands in the same log as mimi's own events while its stdout goes to `mimi.log`, which is otherwise empty.
 
 **The child is its own process group and is killed as one.** `Command::process_group(0)` makes it the group leader, and on the timeout - or on shutdown - `macos::kill_process_group` sends `SIGKILL` to the group, then the child is reaped. Killing the `sh` alone would leave whatever it spawned running, so the test that covers the timeout runs `sleep 31337 & sleep 31337` and asserts through `pgrep` that neither process is left behind. The wrapper lives in `src/macos/mod.rs` next to `user_id()` so `src/hook.rs` stays free of `unsafe`.
 
@@ -137,5 +140,7 @@ wired up; if an item has no caller yet, the work that created it is not finished
 The unsafe Core Audio surface cannot be unit tested. The answer is not "no tests" but pushing the decisions out of the unsafe code into pure functions that can be: buffer-layout interpretation, event diffing, allow-list matching, silence detection, rebuild decisions, file naming, plist rendering. The unsafe blocks stay thin and are covered by running the daemon against a real meeting.
 
 `session::run` is driven in tests with a fake `ActivitySource`, a fake `Capture` and a fake `Sink`. No test creates a real tap.
+
+`hook::run` is driven the same way, with one addition: it takes its clock as an `impl Fn() -> Instant` and its work as a `Runner`, so a test advances a fake clock instead of sleeping a real backoff. What has no pure core is tested against the real thing - `ShellRunner` runs actual sub-second `/bin/sh` commands and proves the group kill through `pgrep`, and one `sink` test encodes a fixture through `writer::spawn` because `remux::to_m4a` only succeeds on audio Core Audio can read. The seam between the sink that writes a sidecar and the hook that reads it is covered end to end rather than from both sides separately, so the two cannot drift.
 
 Before calling anything done: `mise run check` (fmt, clippy `-D warnings`, tests) is green, the unsafe grep above passes, and every module file is declared with `mod <name>;` in its parent - an undeclared module is not compiled, and neither are its tests.
