@@ -253,9 +253,13 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 **Files:**
 - Modify: `src/hook.rs`
 
-- [ ] implement the private loop `run(settings, jobs, shutdown, runner, clock)` per Technical Details, plus `spawn` (seeds the queue with `scan(output_dir)`, builds `ShellRunner`, spawns the thread, returns `Hook`) and `Hook::join`
-- [ ] write tests with a fake `Runner` that records the jobs it was given and returns scripted outcomes, a fake clock the test advances, and a temp `output_dir` holding real sidecar files: a sidecar sent on the channel is run once and marked done; a failing run is retried after `retry_base`, then `2 * retry_base`, and is marked done on the run that succeeds; two pending sidecars present at start are run in name order before a live one; a raised `Shutdown` ends the loop with an unmarked job still `pending` on disk; a disconnected channel ends the loop; a `mark_done` failure (make the sidecar unwritable or replace it with an array) leads to a retry rather than a silent drop
-- [ ] run `mise run check` - must pass before task 6
+- [x] implement the private loop `run(settings, jobs, shutdown, runner, clock)` per Technical Details, plus `spawn` (seeds the queue with `scan(output_dir)`, builds `ShellRunner`, spawns the thread, returns `Hook`) and `Hook::join`
+- [x] write tests with a fake `Runner` that records the jobs it was given and returns scripted outcomes, a fake clock the test advances, and a temp `output_dir` holding real sidecar files: a sidecar sent on the channel is run once and marked done; a failing run is retried after `retry_base`, then `2 * retry_base`, and is marked done on the run that succeeds; two pending sidecars present at start are run in name order before a live one; a raised `Shutdown` ends the loop with an unmarked job still `pending` on disk; a disconnected channel ends the loop; a `mark_done` failure (make the sidecar unwritable or replace it with an array) leads to a retry rather than a silent drop
+- [x] run `mise run check` - must pass before task 6
+- + the `scan` seeding happens inside `run`, not in `spawn`: the loop is the tested surface, and a test that drives it with a fake runner and a fake clock must be able to seed the queue from its own temp `output_dir` without going through the real `ShellRunner`. `spawn` still owns the composition (settings -> `ShellRunner` -> thread)
+- + `enqueue` ignores a sidecar path already in the queue, so the startup scan and a live send of the same recording cannot deliver it twice
+- + the `mark_done` failure is provoked by sealing the output directory at mode 0500 rather than replacing the sidecar with an array: an array never becomes a job in the first place (`job_for` cannot read it), so it never reaches the loop
+- + `spawn` and `Hook::join` are covered by their own test against the real `/bin/sh`; with `mod hook;` still `#[cfg(test)]` (task 6 removes it), an uncalled `spawn` would be dead code under clippy `-D warnings`
 
 ### Task 6: Wire the hook into the daemon
 
