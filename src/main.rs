@@ -164,6 +164,8 @@ fn run() -> ExitCode {
         bit_rate,
         stop_grace_seconds,
         poll_interval_ms,
+        on_complete: _,
+        on_complete_timeout_seconds: _,
     } = config;
 
     let shutdown = Shutdown::new();

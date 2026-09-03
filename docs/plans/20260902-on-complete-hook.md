@@ -194,11 +194,12 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 **Files:**
 - Modify: `src/config.rs`
 
-- [ ] add `on_complete: Option<String>` and `on_complete_timeout_seconds: u32` to `Config`, the two keys to `ConfigFile`, `DEFAULT_ON_COMPLETE_TIMEOUT_SECONDS = 120`, and `ConfigError::BlankOnComplete`
-- [ ] parse them in `from_toml`: trim the command and refuse a blank one, run the timeout through `positive`
-- [ ] extend `Display` (timeout always, command only when set) and the destructuring in `missing_file_yields_defaults`
-- [ ] write tests: defaults with no file (`None`, 120), both keys parsed, blank `on_complete` rejected, zero and negative timeout rejected, `Display` with and without a command, an unknown key still rejected
-- [ ] run `mise run check` - must pass before task 2
+- [x] add `on_complete: Option<String>` and `on_complete_timeout_seconds: u32` to `Config`, the two keys to `ConfigFile`, `DEFAULT_ON_COMPLETE_TIMEOUT_SECONDS = 120`, and `ConfigError::BlankOnComplete`
+- [x] parse them in `from_toml`: trim the command and refuse a blank one, run the timeout through `positive`
+- [x] extend `Display` (timeout always, command only when set) and the destructuring in `missing_file_yields_defaults`
+- [x] write tests: defaults with no file (`None`, 120), both keys parsed, blank `on_complete` rejected, zero and negative timeout rejected, `Display` with and without a command, an unknown key still rejected
+- [x] run `mise run check` - must pass before task 2
+- + `src/main.rs` destructures the two new keys as `_` so the crate keeps compiling; task 6 replaces that with the real wiring
 
 ### Task 2: Sidecar carries file, label and the pending mark
 
