@@ -1,7 +1,8 @@
 use std::fs;
 use std::io;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::thread::{self, JoinHandle};
@@ -13,13 +14,19 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::macos;
+use crate::remux::M4A_EXTENSION;
 use crate::session::Shutdown;
-use crate::sink::{OnComplete, SIDECAR_EXTENSION, write_private};
+use crate::sink::{
+    AUDIO_EXTENSION, OnComplete, RECORDINGS_DIR_MODE, SIDECAR_EXTENSION, write_private,
+};
 
 const SHELL: &str = "/bin/sh";
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const ON_COMPLETE_FIELD: &str = "on_complete";
 const TEMPORARY_SUFFIX: &str = ".tmp";
+const OTHERS_WRITE: u32 = 0o022;
+const STICKY: u32 = 0o1000;
+const ROOT: u32 = 0;
 
 /// Job is one completed recording the hook has to deliver, named by the two files it hands over.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -152,6 +159,108 @@ pub enum HookError {
     Write { path: PathBuf, source: io::Error },
 }
 
+/// Exposure is why an `output_dir` is not the daemon user's alone.
+#[derive(Debug, Error)]
+pub enum Exposure {
+    #[error("{path} could not be created: {source}")]
+    Uncreated { path: PathBuf, source: io::Error },
+    #[error("{0} belongs to another user")]
+    Owned(PathBuf),
+    #[error("{0} is writable by users other than its owner")]
+    Writable(PathBuf),
+    #[error("{0} hands write access to others through an extended ACL")]
+    Granted(PathBuf),
+    #[error("{path} could not be looked at: {source}")]
+    Unknown { path: PathBuf, source: io::Error },
+}
+
+/// claim_private creates the output directory if it is not there yet, accepts it only when `user`
+/// is the only one who can put files in it or swap it for another, and answers with the directory
+/// it judged.
+///
+/// Creating it here rather than leaving it to the first meeting is what makes the check mean
+/// something: a directory that does not exist yet is one another user can still create, and
+/// `session::start_session` would then accept theirs instead of making its own.
+///
+/// The answer is the resolved path because every link on the way to it was followed to reach the
+/// directory that was judged, and a link is somebody else's to repoint afterwards.
+pub fn claim_private(dir: &Path, user: u32) -> Result<PathBuf, Exposure> {
+    let created = fs::DirBuilder::new()
+        .recursive(true)
+        .mode(RECORDINGS_DIR_MODE)
+        .create(dir);
+    if let Err(source) = created {
+        return Err(Exposure::Uncreated {
+            path: dir.to_path_buf(),
+            source,
+        });
+    }
+    let dir = match fs::canonicalize(dir) {
+        Ok(dir) => dir,
+        Err(source) => {
+            return Err(Exposure::Unknown {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    private(&dir, user)?;
+    for ancestor in dir.ancestors().skip(1) {
+        stable(ancestor, user)?;
+    }
+    Ok(dir)
+}
+
+fn private(dir: &Path, user: u32) -> Result<(), Exposure> {
+    let found = match fs::symlink_metadata(dir) {
+        Ok(found) => found,
+        Err(source) => {
+            return Err(Exposure::Unknown {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if found.uid() != user {
+        return Err(Exposure::Owned(dir.to_path_buf()));
+    }
+    if found.mode() & OTHERS_WRITE != 0 {
+        return Err(Exposure::Writable(dir.to_path_buf()));
+    }
+    granted(dir)
+}
+
+fn stable(dir: &Path, user: u32) -> Result<(), Exposure> {
+    let found = match fs::symlink_metadata(dir) {
+        Ok(found) => found,
+        Err(source) => {
+            return Err(Exposure::Unknown {
+                path: dir.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if found.uid() != user && found.uid() != ROOT {
+        return Err(Exposure::Owned(dir.to_path_buf()));
+    }
+    let mode = found.mode();
+    if mode & STICKY == 0 && mode & OTHERS_WRITE != 0 {
+        return Err(Exposure::Writable(dir.to_path_buf()));
+    }
+    granted(dir)
+}
+
+fn granted(dir: &Path) -> Result<(), Exposure> {
+    match macos::acl_grants_write(dir) {
+        Ok(macos::Grant::Nothing) => Ok(()),
+        Ok(macos::Grant::Write) => Err(Exposure::Granted(dir.to_path_buf())),
+        Err(source) => Err(Exposure::Unknown {
+            path: dir.to_path_buf(),
+            source,
+        }),
+    }
+}
+
 #[derive(Deserialize)]
 struct Ledger {
     file: Option<String>,
@@ -185,10 +294,27 @@ pub fn job_for(sidecar: &Path) -> Option<Job> {
         warn!("{} is pending but names no recording", sidecar.display());
         return None;
     };
-    let recording = sidecar.with_file_name(file);
-    if !recording.exists() {
+    let Some(recording) = beside(sidecar, &file) else {
         warn!(
-            "{} is pending but {} is gone",
+            "{} is pending but {file} is not the recording it was written for",
+            sidecar.display()
+        );
+        return None;
+    };
+    let found = match fs::symlink_metadata(&recording) {
+        Ok(found) => found,
+        Err(source) => {
+            warn!(
+                "{} is pending but {} could not be looked at: {source}",
+                sidecar.display(),
+                recording.display()
+            );
+            return None;
+        }
+    };
+    if !found.is_file() {
+        warn!(
+            "{} is pending but {} is not a recording mimi wrote",
             sidecar.display(),
             recording.display()
         );
@@ -198,6 +324,29 @@ pub fn job_for(sidecar: &Path) -> Option<Job> {
         sidecar: sidecar.to_path_buf(),
         recording,
     })
+}
+
+fn beside(sidecar: &Path, file: &str) -> Option<PathBuf> {
+    let mut components = Path::new(file).components();
+    let (Some(Component::Normal(name)), None) = (components.next(), components.next()) else {
+        return None;
+    };
+    let named = Path::new(name);
+    if named.file_stem() != sidecar.file_stem() {
+        return None;
+    }
+    let extension = named.extension()?;
+    let mut audio = false;
+    for candidate in [M4A_EXTENSION, AUDIO_EXTENSION] {
+        if extension == candidate {
+            audio = true;
+            break;
+        }
+    }
+    if !audio {
+        return None;
+    }
+    Some(sidecar.with_file_name(name))
 }
 
 /// scan is every delivery the recordings in `dir` still owe the hook, oldest recording first.
@@ -537,7 +686,7 @@ fn settle(job: &Job, outcome: Outcome) -> Settled {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex, mpsc};
 
@@ -832,6 +981,314 @@ mod tests {
             "enabling the hook publishes nothing retroactively"
         );
         assert_eq!(scan(dir), Vec::new());
+    }
+
+    #[test]
+    fn a_sidecar_naming_anything_but_a_sibling_is_not_a_job() {
+        let dir = TempDir::new();
+        let outside = dir.path().join("outside");
+        let inside = outside.join("recordings");
+        fs::create_dir_all(&inside).expect("create the output directory");
+        write_recording(&outside, "2026-09-02T09-00-00-planted");
+
+        let absolute = outside.join("2026-09-02T09-00-00-planted.m4a");
+        let absolute = absolute.to_str().expect("a utf-8 path");
+        let names = [
+            "../2026-09-02T09-00-00-planted.m4a",
+            "./2026-09-02T09-00-00-planted.m4a",
+            "..",
+            "",
+            absolute,
+        ];
+        for name in names {
+            let sidecar = inside.join("2026-09-02T09-00-00-planted.json");
+            fs::write(
+                &sidecar,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "file": name,
+                    "on_complete": {"state": "pending"},
+                }))
+                .expect("describe the sidecar"),
+            )
+            .expect("write the sidecar");
+            assert_eq!(
+                job_for(&sidecar),
+                None,
+                "{name} names something other than a recording beside the sidecar"
+            );
+            assert_eq!(scan(&inside), Vec::new());
+        }
+    }
+
+    #[test]
+    fn a_sidecar_naming_a_symlink_beside_it_is_not_a_job() {
+        let dir = TempDir::new();
+        let outside = dir.path().join("outside");
+        let inside = outside.join("recordings");
+        fs::create_dir_all(&inside).expect("create the output directory");
+        write_recording(&outside, "planted");
+        std::os::unix::fs::symlink(
+            outside.join("planted.m4a"),
+            inside.join("2026-09-02T09-00-00-symlinked.m4a"),
+        )
+        .expect("plant the symlink");
+        fs::create_dir(inside.join("2026-09-02T09-00-00-directory.m4a"))
+            .expect("plant the directory");
+
+        let stems = [
+            "2026-09-02T09-00-00-symlinked",
+            "2026-09-02T09-00-00-directory",
+        ];
+        for stem in stems {
+            let sidecar = inside.join(format!("{stem}.{SIDECAR_EXTENSION}"));
+            fs::write(
+                &sidecar,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "file": format!("{stem}.m4a"),
+                    "on_complete": {"state": "pending"},
+                }))
+                .expect("describe the sidecar"),
+            )
+            .expect("write the sidecar");
+            assert_eq!(
+                job_for(&sidecar),
+                None,
+                "{stem}.m4a is a way out of the directory, not a recording mimi wrote"
+            );
+            assert_eq!(scan(&inside), Vec::new());
+        }
+    }
+
+    #[test]
+    fn a_sidecar_naming_a_recording_that_is_not_its_own_is_not_a_job() {
+        let dir = TempDir::new();
+        let dir = dir.path();
+        write_sidecar(dir, "2026-09-02T09-00-00-early", None);
+        write_recording(dir, "2026-09-02T09-00-00-early");
+
+        let planted = dir.join(format!("planted.{SIDECAR_EXTENSION}"));
+        fs::write(
+            &planted,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "file": "2026-09-02T09-00-00-early.m4a",
+                "on_complete": {"state": "pending"},
+            }))
+            .expect("describe the sidecar"),
+        )
+        .expect("write the sidecar");
+
+        assert_eq!(
+            job_for(&planted),
+            None,
+            "a sidecar delivers the recording it was written for, not one it points at"
+        );
+        assert_eq!(scan(dir), Vec::new());
+    }
+
+    #[test]
+    fn a_sidecar_naming_something_that_is_not_audio_is_not_a_job() {
+        let dir = TempDir::new();
+        let dir = dir.path();
+        let stem = "2026-09-02T09-00-00-early";
+        fs::write(dir.join(format!("{stem}.txt")), b"notes").expect("write the intruder");
+
+        let names = [format!("{stem}.txt"), stem.to_owned()];
+        for name in names {
+            let sidecar = dir.join(format!("{stem}.{SIDECAR_EXTENSION}"));
+            fs::write(
+                &sidecar,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "file": name,
+                    "on_complete": {"state": "pending"},
+                }))
+                .expect("describe the sidecar"),
+            )
+            .expect("write the sidecar");
+            assert_eq!(
+                job_for(&sidecar),
+                None,
+                "{name} is not a recording mimi wrote"
+            );
+            assert_eq!(scan(dir), Vec::new());
+        }
+    }
+
+    #[test]
+    fn the_output_directory_mimi_creates_is_the_hooks_to_deliver_from() {
+        let dir = TempDir::new();
+        let mimis = fs::Permissions::from_mode(RECORDINGS_DIR_MODE);
+        fs::set_permissions(dir.path(), mimis).expect("create the directory the way mimi does");
+        claim_private(dir.path(), macos::user_id()).expect("mimi's own directory");
+    }
+
+    #[test]
+    fn an_output_directory_that_is_not_there_yet_is_created_before_it_is_judged() {
+        let dir = TempDir::new();
+        let gone = dir.path().join("gone");
+        claim_private(&gone, macos::user_id()).expect("the hook makes its own directory");
+        let found = fs::metadata(&gone).expect("the directory the hook made");
+        assert_eq!(
+            found.mode() & 0o777,
+            RECORDINGS_DIR_MODE,
+            "a directory left for somebody else to create is a directory somebody else can own"
+        );
+        assert_eq!(found.uid(), macos::user_id());
+    }
+
+    #[test]
+    fn an_output_directory_another_user_can_write_is_refused() {
+        let dir = TempDir::new();
+        let modes = [0o777, 0o770, 0o702];
+        for mode in modes {
+            let opened = fs::Permissions::from_mode(mode);
+            fs::set_permissions(dir.path(), opened).expect("open the output directory");
+            let exposure = claim_private(dir.path(), macos::user_id()).expect_err(
+                "a planted sidecar in a shared directory is a delivery mimi never made",
+            );
+            match exposure {
+                Exposure::Writable(path) => assert_eq!(path, resolved(dir.path())),
+                Exposure::Uncreated { path: _, source: _ }
+                | Exposure::Owned(_)
+                | Exposure::Granted(_)
+                | Exposure::Unknown { path: _, source: _ } => {
+                    panic!("{exposure}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_output_directory_another_user_owns_is_refused() {
+        let dir = TempDir::new();
+        let exposure = claim_private(dir.path(), macos::user_id() + 1)
+            .expect_err("its owner decides what the command is handed, not mimi");
+        match exposure {
+            Exposure::Owned(path) => assert_eq!(path, resolved(dir.path())),
+            Exposure::Uncreated { path: _, source: _ }
+            | Exposure::Writable(_)
+            | Exposure::Granted(_)
+            | Exposure::Unknown { path: _, source: _ } => {
+                panic!("{exposure}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_output_directory_an_acl_opens_to_others_is_refused() {
+        let grants = ["everyone allow write", "everyone allow delete_child"];
+        for grant in grants {
+            let dir = TempDir::new();
+            allow(dir.path(), grant);
+            let exposure = claim_private(dir.path(), macos::user_id()).expect_err(
+                "an ACL hands out what the mode bits say nobody has, and the mode bits are what a planted sidecar needs",
+            );
+            match exposure {
+                Exposure::Granted(path) => assert_eq!(path, resolved(dir.path())),
+                Exposure::Uncreated { path: _, source: _ }
+                | Exposure::Owned(_)
+                | Exposure::Writable(_)
+                | Exposure::Unknown { path: _, source: _ } => {
+                    panic!("{exposure}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_output_directory_an_acl_only_denies_on_is_the_hooks_to_deliver_from() {
+        let dir = TempDir::new();
+        allow(dir.path(), "everyone deny delete");
+        claim_private(dir.path(), macos::user_id()).expect(
+            "the ACL every home directory carries takes access away, it does not hand it out",
+        );
+    }
+
+    #[test]
+    fn an_output_directory_another_user_can_swap_is_refused() {
+        let dir = TempDir::new();
+        let holding = dir.path().join("holding");
+        let inside = holding.join("recordings");
+        fs::create_dir_all(&inside).expect("create the output directory");
+        let opened = fs::Permissions::from_mode(0o777);
+        fs::set_permissions(&holding, opened).expect("open the directory that holds it");
+
+        let exposure = claim_private(&inside, macos::user_id()).expect_err(
+            "a directory another user can rename away is one they can put their own in place of",
+        );
+        match exposure {
+            Exposure::Writable(path) => assert_eq!(path, resolved(&holding)),
+            Exposure::Uncreated { path: _, source: _ }
+            | Exposure::Owned(_)
+            | Exposure::Granted(_)
+            | Exposure::Unknown { path: _, source: _ } => {
+                panic!("{exposure}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_output_directory_an_acl_lets_another_user_swap_is_refused() {
+        let dir = TempDir::new();
+        let holding = dir.path().join("holding");
+        let inside = holding.join("recordings");
+        fs::create_dir_all(&inside).expect("create the output directory");
+        allow(&holding, "everyone allow delete_child");
+
+        let exposure = claim_private(&inside, macos::user_id())
+            .expect_err("an ACL hands out the swap the mode bits say nobody can make");
+        match exposure {
+            Exposure::Granted(path) => assert_eq!(path, resolved(&holding)),
+            Exposure::Uncreated { path: _, source: _ }
+            | Exposure::Owned(_)
+            | Exposure::Writable(_)
+            | Exposure::Unknown { path: _, source: _ } => {
+                panic!("{exposure}")
+            }
+        }
+    }
+
+    #[test]
+    fn an_output_directory_held_by_a_sticky_shared_one_is_the_hooks_to_deliver_from() {
+        let dir = TempDir::new();
+        let holding = dir.path().join("holding");
+        let inside = holding.join("recordings");
+        fs::create_dir_all(&inside).expect("create the output directory");
+        let shared = fs::Permissions::from_mode(0o1777);
+        fs::set_permissions(&holding, shared).expect("open the directory that holds it");
+
+        claim_private(&inside, macos::user_id())
+            .expect("a sticky directory hands out no rename of somebody else's directory");
+    }
+
+    #[test]
+    fn an_output_directory_reached_through_a_link_is_claimed_where_the_link_lands() {
+        let dir = TempDir::new();
+        let landing = dir.path().join("landing");
+        fs::create_dir(&landing).expect("the directory the link points at");
+        let mimis = fs::Permissions::from_mode(RECORDINGS_DIR_MODE);
+        fs::set_permissions(&landing, mimis).expect("create the directory the way mimi does");
+        let link = dir.path().join("link");
+        symlink(&landing, &link).expect("plant the link");
+        let claimed = claim_private(&link, macos::user_id()).expect("the link lands in mimi's own");
+        assert_eq!(
+            claimed,
+            resolved(&landing),
+            "a link judged and then followed again is a link somebody else can repoint in between"
+        );
+    }
+
+    fn resolved(dir: &Path) -> PathBuf {
+        dir.canonicalize().expect("the directory behind the path")
+    }
+
+    fn allow(dir: &Path, entry: &str) {
+        let set = Command::new("/bin/chmod")
+            .arg("+a")
+            .arg(entry)
+            .arg(dir)
+            .status()
+            .expect("chmod +a");
+        assert!(set.success(), "chmod +a {entry} failed");
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::fs;
 use std::fs::OpenOptions;
 use std::io;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{SendError, Sender};
 
@@ -16,8 +16,10 @@ use crate::capture::Verdict;
 use crate::remux;
 use crate::writer::Written;
 
-const AUDIO_EXTENSION: &str = "aac";
 const PARTIAL_EXTENSION: &str = "partial";
+
+/// AUDIO_EXTENSION is what a recording kept as the ADTS it was written as is named with.
+pub const AUDIO_EXTENSION: &str = "aac";
 
 /// SIDECAR_EXTENSION is what tells a recording's metadata apart from the recording itself.
 pub const SIDECAR_EXTENSION: &str = "json";
@@ -263,12 +265,18 @@ fn partial_path(dir: &Path, stem: &str) -> PathBuf {
 
 /// write_private replaces `path` with `contents`, readable by the user who recorded it and nobody else.
 pub fn write_private(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+    // `mode` and `truncate` only describe a file this call creates. A name that is already taken -
+    // a stale `<sidecar>.tmp` a crash left behind - would otherwise be written through whatever it
+    // points at, keeping whatever mode it was given: O_NOFOLLOW refuses the symlink, and the mode
+    // is set on the descriptor rather than trusted from the creation.
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(RECORDING_MODE)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    file.set_permissions(fs::Permissions::from_mode(RECORDING_MODE))?;
     file.write_all(contents)?;
     file.sync_all()
 }
@@ -299,7 +307,6 @@ fn completed_path(partial: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::mpsc;
 
@@ -474,6 +481,36 @@ mod tests {
             mode & 0o077,
             0,
             "a meeting must not be readable by group or other"
+        );
+    }
+
+    #[test]
+    fn a_private_write_over_a_taken_name_narrows_it_and_refuses_a_symlink() {
+        let dir = TempDir::new();
+        let taken = dir.path().join("taken.json.tmp");
+        fs::write(&taken, b"{}").expect("write the file");
+        fs::set_permissions(&taken, fs::Permissions::from_mode(0o666))
+            .expect("widen the existing file");
+
+        write_private(&taken, b"{\"state\":\"done\"}").expect("write privately");
+        let mode = fs::metadata(&taken).expect("the file").permissions().mode();
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "a name that was already taken must not keep the mode it was given"
+        );
+
+        let elsewhere = dir.path().join("elsewhere.json");
+        fs::write(&elsewhere, b"untouched").expect("write the target");
+        let planted = dir.path().join("planted.json.tmp");
+        std::os::unix::fs::symlink(&elsewhere, &planted).expect("plant the symlink");
+
+        write_private(&planted, b"{\"state\":\"done\"}")
+            .expect_err("a symlink is not a file mimi wrote");
+        assert_eq!(
+            fs::read(&elsewhere).expect("the target"),
+            b"untouched",
+            "a private write must not reach through a name somebody else planted"
         );
     }
 

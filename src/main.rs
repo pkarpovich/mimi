@@ -178,9 +178,18 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let (hook, sink) = match on_complete {
-        None => (None, LocalFolder::new(None)),
+    let (hook, sink, output_dir) = match on_complete {
+        None => (None, LocalFolder::new(None), output_dir),
         Some(command) => {
+            let output_dir = match hook::claim_private(&output_dir, macos::user_id()) {
+                Ok(output_dir) => output_dir,
+                Err(exposure) => {
+                    eprintln!(
+                        "mimi: on_complete is set but {exposure}, so the command would be handed recordings mimi never wrote"
+                    );
+                    return ExitCode::FAILURE;
+                }
+            };
             let (sidecars, pending) = mpsc::channel();
             let hook = hook::spawn(
                 HookSettings {
@@ -193,7 +202,7 @@ fn run() -> ExitCode {
                 pending,
                 shutdown.clone(),
             );
-            (Some(hook), LocalFolder::new(Some(sidecars)))
+            (Some(hook), LocalFolder::new(Some(sidecars)), output_dir)
         }
     };
 
