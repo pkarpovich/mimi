@@ -666,6 +666,13 @@ fn settle(job: &Job, outcome: Outcome) -> Settled {
                 Settled::Delivered
             }
             Err(error) => {
+                if gone(&error) {
+                    info!(
+                        "the completion hook delivered {}; its sidecar is gone, so there is nothing left to mark",
+                        recording.display()
+                    );
+                    return Settled::Delivered;
+                }
                 warn!(
                     "the completion hook delivered {} but the sidecar still says pending: {error}",
                     recording.display()
@@ -680,6 +687,15 @@ fn settle(job: &Job, outcome: Outcome) -> Settled {
             );
             Settled::Undelivered
         }
+    }
+}
+
+fn gone(error: &HookError) -> bool {
+    match error {
+        HookError::Read { path: _, source } => source.kind() == io::ErrorKind::NotFound,
+        HookError::NotAnObject(_)
+        | HookError::Describe { path: _, source: _ }
+        | HookError::Write { path: _, source: _ } => false,
     }
 }
 
@@ -1502,6 +1518,23 @@ mod tests {
         }
     }
 
+    struct VanishingRunner {
+        ran: Arc<AtomicU32>,
+    }
+
+    impl Runner for VanishingRunner {
+        fn run(&self, job: &Job) -> Outcome {
+            let Self { ran } = self;
+            let Job {
+                sidecar,
+                recording: _,
+            } = job;
+            ran.fetch_add(1, Ordering::SeqCst);
+            fs::remove_file(sidecar).expect("take the sidecar away");
+            Outcome::Done
+        }
+    }
+
     #[derive(Clone)]
     struct FakeClock {
         base: Instant,
@@ -1588,6 +1621,36 @@ mod tests {
         drop(sender);
         thread.join().expect("the hook thread");
         assert_eq!(ran.ran().len(), 1, "a delivered recording is run once");
+    }
+
+    #[test]
+    fn a_run_that_took_its_sidecar_away_is_never_run_again() {
+        let dir = TempDir::new();
+        let sidecar = recorded(dir.path(), "2026-09-02T09-00-00-early");
+        let (sender, receiver) = mpsc::channel();
+        let ran = Arc::new(AtomicU32::new(0));
+        let runner = VanishingRunner {
+            ran: Arc::clone(&ran),
+        };
+        let clock = FakeClock::new();
+        let shutdown = Shutdown::new();
+
+        let ticking = clock.clone();
+        let settings = settings(dir.path());
+        let thread =
+            thread::spawn(move || run(settings, receiver, shutdown, runner, move || ticking.now()));
+
+        eventually("the pending recording was never run", || !sidecar.exists());
+        clock.advance(RETRY_CAP);
+        thread::sleep(2 * POLL_INTERVAL);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            1,
+            "a sidecar that is gone leaves nothing to deliver again"
+        );
+
+        drop(sender);
+        thread.join().expect("the hook thread");
     }
 
     #[test]
