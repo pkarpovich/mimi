@@ -277,11 +277,14 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 
 ### Task 7: Verify acceptance criteria
 
-- [ ] verify every property in Overview is implemented and every non-goal is absent: no network crate in `Cargo.toml`, no sidecar without a hook carries `on_complete`, no scan result for a sidecar without the field
-- [ ] verify the edge cases: remux failure keeps the aac and `file` names it; a sidecar whose audio was deleted is skipped with one warn per scan; a hook that exits 0 after mimi was killed is run again at the next start (documented as the idempotency requirement)
-- [ ] run the full test suite: `mise run check`
-- [ ] run the unsafe grep from `CLAUDE.md`
-- [ ] confirm every new module is declared with `mod` and no `#[allow(dead_code)]` was added
+- [x] verify every property in Overview is implemented and every non-goal is absent: no network crate in `Cargo.toml`, no sidecar without a hook carries `on_complete`, no scan result for a sidecar without the field
+- [x] verify the edge cases: remux failure keeps the aac and `file` names it; a sidecar whose audio was deleted is skipped with one warn per scan; a hook that exits 0 after mimi was killed is run again at the next start (documented as the idempotency requirement)
+- [x] run the full test suite: `mise run check`
+- [x] run the unsafe grep from `CLAUDE.md`
+- [x] confirm every new module is declared with `mod` and no `#[allow(dead_code)]` was added
+- ! `Ledger.file` was `String`, so a sidecar written before this feature - no `file`, no `on_complete` - failed to deserialize and was logged at warn as "not a sidecar mimi wrote" on every startup scan. The scan result was right, the log was not: Technical Details warns on an unparsable sidecar and a pending one whose audio is gone, and an old recording is neither. `file` became `Option<String>` and is required only after `on_complete` is `Pending`, with its own warn for a pending sidecar that names no recording. A test writes a v0.1.1-shaped sidecar and asserts `job_for` and `scan` both pass it over silently
+- + the idempotency requirement is stated in Technical Details and reaches the README in task 8; the behaviour behind it is covered by the shutdown and startup-scan tests in `src/hook.rs`
+- + `Cargo.toml` carries no network crate: the dependencies are Core Audio, `serde`, `serde_json`, `chrono`, `libc`, `signal-hook`, `toml`, `thiserror`, `argh` and `tracing`, exactly as before this plan
 
 ### Task 8: Update documentation
 

@@ -154,7 +154,7 @@ pub enum HookError {
 
 #[derive(Deserialize)]
 struct Ledger {
-    file: String,
+    file: Option<String>,
     on_complete: Option<OnComplete>,
 }
 
@@ -181,6 +181,10 @@ pub fn job_for(sidecar: &Path) -> Option<Job> {
         Some(OnComplete::Pending) => {}
         Some(OnComplete::Done { at: _ }) | None => return None,
     }
+    let Some(file) = file else {
+        warn!("{} is pending but names no recording", sidecar.display());
+        return None;
+    };
     let recording = sidecar.with_file_name(file);
     if !recording.exists() {
         warn!(
@@ -784,6 +788,38 @@ mod tests {
             ],
             "only a pending sidecar whose recording is still there is the hook's business"
         );
+    }
+
+    #[test]
+    fn a_recording_that_finished_before_the_hook_existed_is_not_the_hooks_business() {
+        let dir = TempDir::new();
+        let dir = dir.path();
+        let sidecar = dir.join("2026-08-30T14-32-05-thebrowser.json");
+        fs::write(
+            &sidecar,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "started_at": "2026-08-30T14:32:05+02:00",
+                "ended_at": "2026-08-30T15:02:35+02:00",
+                "duration_seconds": 1830,
+                "bundle_id": "company.thebrowser.browser.helper",
+                "sample_rate": 24_000,
+                "channels": 2,
+                "device_changes": 0,
+                "failed_device_changes": 0,
+                "silent": false,
+                "write_failed": false,
+            }))
+            .expect("describe the sidecar"),
+        )
+        .expect("write the sidecar");
+        write_recording(dir, "2026-08-30T14-32-05-thebrowser");
+
+        assert_eq!(
+            job_for(&sidecar),
+            None,
+            "enabling the hook publishes nothing retroactively"
+        );
+        assert_eq!(scan(dir), Vec::new());
     }
 
     #[test]
