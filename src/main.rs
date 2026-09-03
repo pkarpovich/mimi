@@ -6,6 +6,8 @@ mod plist;
 mod activity;
 mod capture;
 mod config;
+#[cfg(test)]
+mod hook;
 mod instance;
 mod macos;
 mod remux;

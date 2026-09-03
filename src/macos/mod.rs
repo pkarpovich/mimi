@@ -18,6 +18,14 @@ pub fn user_id() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// kill_process_group ends every process in the group led by `pid`, leader included.
+///
+/// The result is ignored: a group that is already gone is the expected outcome, not a failure.
+#[cfg(test)]
+pub fn kill_process_group(pid: u32) {
+    unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
+}
+
 /// Scalar marks the types a Core Audio property may be read into byte-for-byte; implementing it for
 /// a type that is not a plain fixed-size value would let `read_scalar` build an invalid one.
 pub trait Scalar: Copy {}

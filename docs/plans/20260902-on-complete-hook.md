@@ -224,10 +224,15 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 - Modify: `src/main.rs` (declare `mod hook;`)
 - Modify: `src/macos/mod.rs`
 
-- [ ] add `macos::kill_process_group(pid: u32)` beside `user_id`, keeping `src/hook.rs` free of `unsafe`
-- [ ] create `src/hook.rs` with `Job`, `Outcome`, `Failure`, `Runner`, `ShellRunner` (command, timeout, cwd, a `Shutdown` clone) and `ShellRunner::run`: `sh -c`, the two `MIMI_*` variables, `Stdio::null` for stdin and inherited stdout and stderr, `process_group(0)`, a 200 ms `try_wait` poll bounded by the timeout, group kill and reap on expiry or on shutdown
-- [ ] write tests against the real `/bin/sh`: `exit 0` is `Done`; `exit 3` is `Failed(Exited(3))`; `sleep 30` with a 300 ms timeout is `Failed(TimedOut)` and returns within about one poll tick after the deadline; a nonexistent shell path is `NotStarted`; the child sees `MIMI_RECORDING` and `MIMI_SIDECAR` and runs in the configured cwd (probe with a command that writes those into a file in the temp dir); a raised `Shutdown` ends a sleeping child early
-- [ ] run `mise run check` and the unsafe grep - must pass before task 4
+- [x] add `macos::kill_process_group(pid: u32)` beside `user_id`, keeping `src/hook.rs` free of `unsafe`
+- [x] create `src/hook.rs` with `Job`, `Outcome`, `Failure`, `Runner`, `ShellRunner` (command, timeout, cwd, a `Shutdown` clone) and `ShellRunner::run`: `sh -c`, the two `MIMI_*` variables, `Stdio::null` for stdin and inherited stdout and stderr, `process_group(0)`, a 200 ms `try_wait` poll bounded by the timeout, group kill and reap on expiry or on shutdown
+- [x] write tests against the real `/bin/sh`: `exit 0` is `Done`; `exit 3` is `Failed(Exited(3))`; `sleep 30` with a 300 ms timeout is `Failed(TimedOut)` and returns within about one poll tick after the deadline; a nonexistent shell path is `NotStarted`; the child sees `MIMI_RECORDING` and `MIMI_SIDECAR` and runs in the configured cwd (probe with a command that writes those into a file in the temp dir); a raised `Shutdown` ends a sleeping child early
+- [x] run `mise run check` and the unsafe grep - must pass before task 4
+- + `mod hook;` is declared `#[cfg(test)]` and `macos::kill_process_group` carries the same attribute, because clippy `-D warnings` denies `dead_code` on the non-test bin target and nothing in `main` reaches the module until task 6, where both attributes go away. `#[allow(dead_code)]` is forbidden, so the module is simply not compiled into the binary yet - the same shape `src/plist.rs` already has
+- + `NotStarted` is reached with a nonexistent working directory rather than a nonexistent shell path: the shell is the fixed `/bin/sh` const the contract names, and a `shell` field would be configurability the plan does not ask for
+- + a raised `Shutdown` returns `Failed(Signaled)`, not `Failed(TimedOut)`: the child was killed, its deadline was not reached, and the loop that raised the flag discards the outcome anyway
+- + the timeout test runs `sleep 31337 & sleep 31337` and asserts through `pgrep` that neither survives, so the process-group kill is measured rather than assumed
+- + `Shutdown::request` (already `#[cfg(test)]`) became `pub` so `src/hook.rs`'s tests can raise the flag
 
 ### Task 4: The sidecar ledger: `job_for`, `scan`, `mark_done`, `retry_after`
 
@@ -254,6 +259,7 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 **Files:**
 - Modify: `src/main.rs`
 
+- [ ] drop the `#[cfg(test)]` from `mod hook;` in `src/main.rs` and from `macos::kill_process_group`
 - [ ] in `run()`, when `on_complete` is set: create the channel, `hook::spawn` with the settings from Technical Details and a clone of `shutdown`, `LocalFolder::new(Some(sender))`; otherwise `LocalFolder::new(None)`
 - [ ] join the hook after `session::run` returns; the sink (and with it the sender) must be dropped before the join so a loop waiting on the channel also ends when shutdown was not raised
 - [ ] confirm `mimi --check-config` prints the two keys through the existing `Display`

@@ -62,7 +62,7 @@ impl Shutdown {
     }
 
     #[cfg(test)]
-    fn request(&self) {
+    pub fn request(&self) {
         let Self(raised) = self;
         raised.store(true, Ordering::Relaxed);
     }
