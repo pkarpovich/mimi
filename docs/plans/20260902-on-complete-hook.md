@@ -239,11 +239,14 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 **Files:**
 - Modify: `src/hook.rs`
 
-- [ ] implement `job_for` (deserialize `file` and `on_complete` only, require `Pending` and an existing audio file, warn on the two skip cases named in Technical Details) and `scan` (every `*.json` in the directory, sorted by name, unreadable directory is a warn and an empty vector)
-- [ ] implement `mark_done` as read into `serde_json::Value`, set `on_complete`, pretty-serialize, write `<sidecar>.tmp` at mode 0600, rename over the original; non-object JSON is `HookError`
-- [ ] implement `retry_after`
-- [ ] write tests: `scan` returns only pending sidecars with audio present, in name order, and ignores a sidecar with no `on_complete`, a done one, a pending one whose audio is missing, and a file that is not JSON; `mark_done` flips the state, sets `at`, preserves every other field byte-equal after re-parsing, keeps mode 0600 and leaves no `.tmp` behind; `mark_done` on a JSON array is an error; `retry_after` for attempts 1, 2, 3 and past the cap
-- [ ] run `mise run check` - must pass before task 5
+- [x] implement `job_for` (deserialize `file` and `on_complete` only, require `Pending` and an existing audio file, warn on the two skip cases named in Technical Details) and `scan` (every `*.json` in the directory, sorted by name, unreadable directory is a warn and an empty vector)
+- [x] implement `mark_done` as read into `serde_json::Value`, set `on_complete`, pretty-serialize, write `<sidecar>.tmp` at mode 0600, rename over the original; non-object JSON is `HookError`
+- [x] implement `retry_after`
+- [x] write tests: `scan` returns only pending sidecars with audio present, in name order, and ignores a sidecar with no `on_complete`, a done one, a pending one whose audio is missing, and a file that is not JSON; `mark_done` flips the state, sets `at`, preserves every other field byte-equal after re-parsing, keeps mode 0600 and leaves no `.tmp` behind; `mark_done` on a JSON array is an error; `retry_after` for attempts 1, 2, 3 and past the cap
+- [x] run `mise run check` - must pass before task 5
+- + `sink::write_private` and `sink::SIDECAR_EXTENSION` became `pub` rather than being duplicated in `src/hook.rs`: the 0600 mode of a sidecar and the extension that identifies one are the sink's policy, and a second copy would be a second place to get them wrong
+- + `HookError` also carries `Read` and `Describe`: `mark_done` reads and re-serializes before it writes, and a sidecar that vanished between the run and the rewrite must reach the loop as a failure rather than a panic
+- + `mark_done` removes its `<sidecar>.tmp` when the rename fails, so a failed rewrite leaves the directory as it found it
 
 ### Task 5: The hook thread: queue, backoff, shutdown
 

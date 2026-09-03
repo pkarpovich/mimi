@@ -18,7 +18,9 @@ use crate::writer::Written;
 
 const AUDIO_EXTENSION: &str = "aac";
 const PARTIAL_EXTENSION: &str = "partial";
-const SIDECAR_EXTENSION: &str = "json";
+
+/// SIDECAR_EXTENSION is what tells a recording's metadata apart from the recording itself.
+pub const SIDECAR_EXTENSION: &str = "json";
 
 /// RECORDING_MODE keeps a meeting readable by the user who recorded it and nobody else.
 pub const RECORDING_MODE: u32 = 0o600;
@@ -256,7 +258,8 @@ fn partial_path(dir: &Path, stem: &str) -> PathBuf {
     dir.join(format!("{stem}.{AUDIO_EXTENSION}.{PARTIAL_EXTENSION}"))
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
+/// write_private replaces `path` with `contents`, readable by the user who recorded it and nobody else.
+pub fn write_private(path: &Path, contents: &[u8]) -> Result<(), io::Error> {
     let mut file = OpenOptions::new()
         .write(true)
         .create(true)
