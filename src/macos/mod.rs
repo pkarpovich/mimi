@@ -21,7 +21,6 @@ pub fn user_id() -> u32 {
 /// kill_process_group ends every process in the group led by `pid`, leader included.
 ///
 /// The result is ignored: a group that is already gone is the expected outcome, not a failure.
-#[cfg(test)]
 pub fn kill_process_group(pid: u32) {
     unsafe { libc::killpg(pid as i32, libc::SIGKILL) };
 }

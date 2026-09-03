@@ -6,7 +6,6 @@ mod plist;
 mod activity;
 mod capture;
 mod config;
-#[cfg(test)]
 mod hook;
 mod instance;
 mod macos;
@@ -29,11 +28,14 @@ use crate::activity::Devices;
 use crate::activity::poller::{self, CoreAudio};
 use crate::capture::{CaptureConfig, Tap};
 use crate::config::Config;
+use crate::hook::HookSettings;
 use crate::session::{Settings, Shutdown};
 use crate::sink::LocalFolder;
 
 const AGGREGATE_NAME: &str = "mimi";
 const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
+const HOOK_RETRY_BASE: Duration = Duration::from_secs(60);
+const HOOK_RETRY_CAP: Duration = Duration::from_secs(1800);
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -166,8 +168,8 @@ fn run() -> ExitCode {
         bit_rate,
         stop_grace_seconds,
         poll_interval_ms,
-        on_complete: _,
-        on_complete_timeout_seconds: _,
+        on_complete,
+        on_complete_timeout_seconds,
     } = config;
 
     let shutdown = Shutdown::new();
@@ -175,6 +177,25 @@ fn run() -> ExitCode {
         eprintln!("mimi: the signal handlers could not be installed: {error}");
         return ExitCode::FAILURE;
     }
+
+    let (hook, sink) = match on_complete {
+        None => (None, LocalFolder::new(None)),
+        Some(command) => {
+            let (sidecars, pending) = mpsc::channel();
+            let hook = hook::spawn(
+                HookSettings {
+                    command,
+                    timeout: Duration::from_secs(on_complete_timeout_seconds.into()),
+                    output_dir: output_dir.clone(),
+                    retry_base: HOOK_RETRY_BASE,
+                    retry_cap: HOOK_RETRY_CAP,
+                },
+                pending,
+                shutdown.clone(),
+            );
+            (Some(hook), LocalFolder::new(Some(sidecars)))
+        }
+    };
 
     let interval = Duration::from_millis(poll_interval_ms.into());
     let devices = Devices {
@@ -197,11 +218,15 @@ fn run() -> ExitCode {
         },
         devices,
         &mut capture,
-        &LocalFolder::new(None),
+        &sink,
         incoming,
         &shutdown,
     );
 
+    drop(sink);
+    if let Some(hook) = hook {
+        hook.join();
+    }
     drop(stop);
     ExitCode::SUCCESS
 }

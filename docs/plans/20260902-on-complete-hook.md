@@ -266,12 +266,14 @@ hook thread: scan(output_dir) seeds the queue at start; channel feeds it live
 **Files:**
 - Modify: `src/main.rs`
 
-- [ ] drop the `#[cfg(test)]` from `mod hook;` in `src/main.rs` and from `macos::kill_process_group`
-- [ ] in `run()`, when `on_complete` is set: create the channel, `hook::spawn` with the settings from Technical Details and a clone of `shutdown`, `LocalFolder::new(Some(sender))`; otherwise `LocalFolder::new(None)`
-- [ ] join the hook after `session::run` returns; the sink (and with it the sender) must be dropped before the join so a loop waiting on the channel also ends when shutdown was not raised
-- [ ] confirm `mimi --check-config` prints the two keys through the existing `Display`
-- [ ] this task has no unit-testable surface of its own; run the full suite and the unsafe grep, and confirm `cargo build --release` produces a binary whose `--check-config` output matches a config file with and without `on_complete`
-- [ ] run `mise run check` - must pass before task 7
+- [x] drop the `#[cfg(test)]` from `mod hook;` in `src/main.rs` and from `macos::kill_process_group`
+- [x] in `run()`, when `on_complete` is set: create the channel, `hook::spawn` with the settings from Technical Details and a clone of `shutdown`, `LocalFolder::new(Some(sender))`; otherwise `LocalFolder::new(None)`
+- [x] join the hook after `session::run` returns; the sink (and with it the sender) must be dropped before the join so a loop waiting on the channel also ends when shutdown was not raised
+- [x] confirm `mimi --check-config` prints the two keys through the existing `Display`
+- [x] this task has no unit-testable surface of its own; run the full suite and the unsafe grep, and confirm `cargo build --release` produces a binary whose `--check-config` output matches a config file with and without `on_complete`
+- [x] run `mise run check` - must pass before task 7
+- + `Failure` became a `thiserror::Error` and `settle` logs it with `{failure}` instead of `{failure:?}`: once `mod hook;` is compiled into the binary, a derived `Debug` no longer counts as a read of `Exited(i32)` and `NotStarted(io::Error)`, so clippy `-D warnings` denied both fields as dead code and `#[allow(dead_code)]` is forbidden. The log line reads better for it
+- + the retry schedule lives in `main` as `HOOK_RETRY_BASE` (60 s) and `HOOK_RETRY_CAP` (30 min), matching the composition the plan describes
 
 ### Task 7: Verify acceptance criteria
 

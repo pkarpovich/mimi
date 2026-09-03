@@ -36,11 +36,15 @@ pub enum Outcome {
 }
 
 /// Failure is why a run of the hook command left its job undelivered.
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum Failure {
+    #[error("it exited {0}")]
     Exited(i32),
+    #[error("a signal ended it")]
     Signaled,
+    #[error("it outlived its timeout")]
     TimedOut,
+    #[error("it could not be started: {0}")]
     NotStarted(io::Error),
 }
 
@@ -517,7 +521,7 @@ fn settle(job: &Job, outcome: Outcome) -> Settled {
         },
         Outcome::Failed(failure) => {
             warn!(
-                "the completion hook left {} undelivered: {failure:?}",
+                "the completion hook left {} undelivered: {failure}",
                 recording.display()
             );
             Settled::Undelivered
