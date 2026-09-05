@@ -62,7 +62,7 @@ impl Shutdown {
     }
 
     #[cfg(test)]
-    fn request(&self) {
+    pub fn request(&self) {
         let Self(raised) = self;
         raised.store(true, Ordering::Relaxed);
     }
@@ -72,6 +72,7 @@ struct Session {
     partial: PathBuf,
     started_at: DateTime<Local>,
     bundle_id: BundleId,
+    label: String,
     writer: Writer,
 }
 
@@ -223,6 +224,7 @@ fn start_session(
         partial,
         started_at,
         bundle_id,
+        label,
         writer,
     })
 }
@@ -240,6 +242,7 @@ fn finish_session(
         partial,
         started_at,
         bundle_id,
+        label,
         writer,
     } = session;
     let Output {
@@ -269,6 +272,7 @@ fn finish_session(
         started_at,
         ended_at: Local::now(),
         bundle_id,
+        label,
         sample_rate: *sample_rate,
         channels: CHANNELS,
         device_changes: succeeded,
@@ -644,6 +648,7 @@ mod tests {
             started_at,
             ended_at,
             bundle_id,
+            label,
             sample_rate,
             channels,
             device_changes,
@@ -661,6 +666,10 @@ mod tests {
         assert_eq!(
             bundle_id,
             &BundleId::new("company.thebrowser.browser.helper")
+        );
+        assert_eq!(
+            label, "thebrowser",
+            "the allow-list label the file was named after reaches the sink"
         );
         assert_eq!(*sample_rate, 24_000);
         assert_eq!(*channels, 2);

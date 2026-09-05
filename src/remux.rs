@@ -85,9 +85,12 @@ pub fn to_m4a(source: &Path, destination: &Path) -> Result<Remuxed, RemuxError> 
     })
 }
 
+/// M4A_EXTENSION is what a remuxed recording is named with.
+pub const M4A_EXTENSION: &str = "m4a";
+
 /// destination_for names the m4a that replaces a recording, keeping everything but the extension.
 pub fn destination_for(source: &Path) -> PathBuf {
-    source.with_extension("m4a")
+    source.with_extension(M4A_EXTENSION)
 }
 
 #[cfg(test)]

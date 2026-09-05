@@ -12,6 +12,7 @@ const DEFAULT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_BIT_RATE: u32 = 96_000;
 const DEFAULT_STOP_GRACE_SECONDS: u32 = 15;
 const DEFAULT_POLL_INTERVAL_MS: u32 = 1_000;
+const DEFAULT_ON_COMPLETE_TIMEOUT_SECONDS: u32 = 120;
 const AAC_SAMPLE_RATES: [u32; 12] = [
     8_000, 11_025, 12_000, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000, 64_000, 88_200, 96_000,
 ];
@@ -50,6 +51,8 @@ pub struct Config {
     pub bit_rate: u32,
     pub stop_grace_seconds: u32,
     pub poll_interval_ms: u32,
+    pub on_complete: Option<String>,
+    pub on_complete_timeout_seconds: u32,
 }
 
 #[derive(Debug, Error)]
@@ -74,6 +77,8 @@ pub enum ConfigError {
     BlankBundlePrefix,
     #[error("output_dir must not be empty")]
     EmptyOutputDir,
+    #[error("on_complete must not be blank; remove the key to disable the hook")]
+    BlankOnComplete,
 }
 
 #[derive(Debug, Deserialize)]
@@ -85,6 +90,8 @@ struct ConfigFile {
     bit_rate: Option<i64>,
     stop_grace_seconds: Option<i64>,
     poll_interval_ms: Option<i64>,
+    on_complete: Option<String>,
+    on_complete_timeout_seconds: Option<i64>,
 }
 
 /// load reads `{home}/.config/mimi/config.toml`, falling back to the defaults when it is absent.
@@ -115,6 +122,8 @@ fn from_toml(contents: &str, home: &Path) -> Result<Config, ConfigError> {
         bit_rate,
         stop_grace_seconds,
         poll_interval_ms,
+        on_complete,
+        on_complete_timeout_seconds,
     } = file;
 
     let output_dir = match output_dir {
@@ -143,6 +152,17 @@ fn from_toml(contents: &str, home: &Path) -> Result<Config, ConfigError> {
         return Err(ConfigError::NoBundlePrefixes);
     }
 
+    let on_complete = match on_complete {
+        Some(command) => {
+            let command = command.trim();
+            if command.is_empty() {
+                return Err(ConfigError::BlankOnComplete);
+            }
+            Some(command.to_owned())
+        }
+        None => None,
+    };
+
     Ok(Config {
         output_dir,
         meeting_bundle_prefixes,
@@ -157,6 +177,12 @@ fn from_toml(contents: &str, home: &Path) -> Result<Config, ConfigError> {
             "poll_interval_ms",
             poll_interval_ms,
             DEFAULT_POLL_INTERVAL_MS,
+        )?,
+        on_complete,
+        on_complete_timeout_seconds: positive(
+            "on_complete_timeout_seconds",
+            on_complete_timeout_seconds,
+            DEFAULT_ON_COMPLETE_TIMEOUT_SECONDS,
         )?,
     })
 }
@@ -237,6 +263,8 @@ impl fmt::Display for Config {
             bit_rate,
             stop_grace_seconds,
             poll_interval_ms,
+            on_complete,
+            on_complete_timeout_seconds,
         } = self;
         writeln!(f, "output_dir = {:?}", output_dir.display().to_string())?;
         write!(f, "meeting_bundle_prefixes = [")?;
@@ -249,7 +277,14 @@ impl fmt::Display for Config {
         writeln!(f, "sample_rate = {sample_rate}")?;
         writeln!(f, "bit_rate = {bit_rate}")?;
         writeln!(f, "stop_grace_seconds = {stop_grace_seconds}")?;
-        write!(f, "poll_interval_ms = {poll_interval_ms}")
+        writeln!(f, "poll_interval_ms = {poll_interval_ms}")?;
+        if let Some(command) = on_complete {
+            writeln!(f, "on_complete = {command:?}")?;
+        }
+        write!(
+            f,
+            "on_complete_timeout_seconds = {on_complete_timeout_seconds}"
+        )
     }
 }
 
@@ -311,6 +346,8 @@ mod tests {
             bit_rate,
             stop_grace_seconds,
             poll_interval_ms,
+            on_complete,
+            on_complete_timeout_seconds,
         } = config;
         assert_eq!(output_dir, home.path().join("Recordings/mimi"));
         assert_eq!(
@@ -327,6 +364,8 @@ mod tests {
         assert_eq!(bit_rate, 96_000);
         assert_eq!(stop_grace_seconds, 15);
         assert_eq!(poll_interval_ms, 1_000);
+        assert_eq!(on_complete, None);
+        assert_eq!(on_complete_timeout_seconds, 120);
     }
 
     #[test]
@@ -340,6 +379,8 @@ sample_rate = 48000
 bit_rate = 128000
 stop_grace_seconds = 30
 poll_interval_ms = 500
+on_complete = "/usr/local/bin/publish"
+on_complete_timeout_seconds = 45
 "#,
         );
         let config = load(home.path()).expect("full file");
@@ -352,6 +393,8 @@ poll_interval_ms = 500
                 bit_rate: 128_000,
                 stop_grace_seconds: 30,
                 poll_interval_ms: 500,
+                on_complete: Some("/usr/local/bin/publish".to_owned()),
+                on_complete_timeout_seconds: 45,
             }
         );
     }
@@ -408,7 +451,8 @@ poll_interval_ms = 500
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected a parse error, got {error}"),
         }
     }
 
@@ -424,7 +468,8 @@ poll_interval_ms = 500
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected a parse error, got {error}"),
         }
     }
 
@@ -440,7 +485,8 @@ poll_interval_ms = 500
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected a parse error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected a parse error, got {error}"),
         }
     }
 
@@ -452,6 +498,16 @@ poll_interval_ms = 500
             ("bit_rate = -1\n", "bit_rate", -1),
             ("stop_grace_seconds = 0\n", "stop_grace_seconds", 0),
             ("poll_interval_ms = -5\n", "poll_interval_ms", -5),
+            (
+                "on_complete_timeout_seconds = 0\n",
+                "on_complete_timeout_seconds",
+                0,
+            ),
+            (
+                "on_complete_timeout_seconds = -30\n",
+                "on_complete_timeout_seconds",
+                -30,
+            ),
         ];
         for (contents, field, value) in cases {
             let error = from_toml(contents, home).expect_err(contents);
@@ -469,7 +525,8 @@ poll_interval_ms = 500
                 | ConfigError::Unsupported { .. }
                 | ConfigError::NoBundlePrefixes
                 | ConfigError::BlankBundlePrefix
-                | ConfigError::EmptyOutputDir => panic!("expected {field} to be rejected"),
+                | ConfigError::EmptyOutputDir
+                | ConfigError::BlankOnComplete => panic!("expected {field} to be rejected"),
             }
         }
     }
@@ -489,7 +546,8 @@ poll_interval_ms = 500
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected an overflow error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected an overflow error, got {error}"),
         }
     }
 
@@ -510,7 +568,8 @@ poll_interval_ms = 500
                 | ConfigError::TooLarge { .. }
                 | ConfigError::NoBundlePrefixes
                 | ConfigError::BlankBundlePrefix
-                | ConfigError::EmptyOutputDir => panic!("expected {contents} to be rejected"),
+                | ConfigError::EmptyOutputDir
+                | ConfigError::BlankOnComplete => panic!("expected {contents} to be rejected"),
             }
         }
     }
@@ -542,7 +601,8 @@ poll_interval_ms = 500
                 | ConfigError::TooLarge { .. }
                 | ConfigError::NoBundlePrefixes
                 | ConfigError::BlankBundlePrefix
-                | ConfigError::EmptyOutputDir => panic!("expected {contents} to be rejected"),
+                | ConfigError::EmptyOutputDir
+                | ConfigError::BlankOnComplete => panic!("expected {contents} to be rejected"),
             }
         }
     }
@@ -559,7 +619,8 @@ poll_interval_ms = 500
             | ConfigError::TooLarge { .. }
             | ConfigError::Unsupported { .. }
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected an empty-list error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected an empty-list error, got {error}"),
         }
     }
 
@@ -579,7 +640,8 @@ poll_interval_ms = 500
                 | ConfigError::TooLarge { .. }
                 | ConfigError::Unsupported { .. }
                 | ConfigError::NoBundlePrefixes
-                | ConfigError::EmptyOutputDir => {
+                | ConfigError::EmptyOutputDir
+                | ConfigError::BlankOnComplete => {
                     panic!("expected a blank-prefix error, got {error}")
                 }
             }
@@ -598,7 +660,8 @@ poll_interval_ms = 500
             | ConfigError::TooLarge { .. }
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
-            | ConfigError::BlankBundlePrefix => panic!("expected an empty-dir error, got {error}"),
+            | ConfigError::BlankBundlePrefix
+            | ConfigError::BlankOnComplete => panic!("expected an empty-dir error, got {error}"),
         }
     }
 
@@ -616,7 +679,8 @@ poll_interval_ms = 500
             | ConfigError::Unsupported { .. }
             | ConfigError::NoBundlePrefixes
             | ConfigError::BlankBundlePrefix
-            | ConfigError::EmptyOutputDir => panic!("expected a read error, got {error}"),
+            | ConfigError::EmptyOutputDir
+            | ConfigError::BlankOnComplete => panic!("expected a read error, got {error}"),
         }
     }
 
@@ -632,5 +696,55 @@ poll_interval_ms = 500
         assert!(printed.contains("bit_rate = 96000"));
         assert!(printed.contains("stop_grace_seconds = 15"));
         assert!(printed.contains("poll_interval_ms = 1000"));
+        assert!(printed.contains("on_complete_timeout_seconds = 120"));
+    }
+
+    #[test]
+    fn a_blank_on_complete_is_rejected() {
+        let home = Path::new("/Users/tester");
+        for contents in ["on_complete = \"\"\n", "on_complete = \"   \"\n"] {
+            let error = from_toml(contents, home).expect_err("a blank command runs nothing");
+            match error {
+                ConfigError::BlankOnComplete => {}
+                ConfigError::Read { .. }
+                | ConfigError::Parse(_)
+                | ConfigError::NotPositive { .. }
+                | ConfigError::TooLarge { .. }
+                | ConfigError::Unsupported { .. }
+                | ConfigError::NoBundlePrefixes
+                | ConfigError::BlankBundlePrefix
+                | ConfigError::EmptyOutputDir => {
+                    panic!("expected a blank-command error, got {error}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn on_complete_is_stored_trimmed() {
+        let home = Path::new("/Users/tester");
+        let config = from_toml("on_complete = \"  publish.sh  \"\n", home).expect("a command");
+        assert_eq!(config.on_complete, Some("publish.sh".to_owned()));
+    }
+
+    #[test]
+    fn display_omits_on_complete_when_it_is_unset() {
+        let home = Path::new("/Users/tester");
+        let printed = from_toml("", home).expect("defaults").to_string();
+        assert!(!printed.contains("on_complete ="));
+        assert!(printed.contains("on_complete_timeout_seconds = 120"));
+    }
+
+    #[test]
+    fn display_reports_a_configured_command() {
+        let home = Path::new("/Users/tester");
+        let printed = from_toml(
+            "on_complete = \"publish.sh\"\non_complete_timeout_seconds = 30\n",
+            home,
+        )
+        .expect("a command")
+        .to_string();
+        assert!(printed.contains("on_complete = \"publish.sh\""));
+        assert!(printed.contains("on_complete_timeout_seconds = 30"));
     }
 }
