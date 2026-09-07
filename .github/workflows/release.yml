@@ -108,9 +108,9 @@ jobs:
       # verdict holds offline too.
       - name: Notarize and staple
         env:
-          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
-          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+          KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          KEY_P8: ${{ secrets.ASC_KEY_CONTENT }}
         run: |
           key=$(mktemp)
           printf '%s\n' "$KEY_P8" > "$key"
