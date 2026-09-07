@@ -226,35 +226,31 @@ jobs:
             app "Mimi.app"
             binary "#{appdir}/Mimi.app/Contents/MacOS/mimi"
 
-            # Homebrew upgrades a cask by uninstalling the old version first, and the
-            # uninstall stanza below unloads the agent and removes its plist. Without
-            # this the daemon is simply gone after every upgrade, silently. postflight
-            # runs on install and on upgrade alike, and mimi install is idempotent.
-            # It stays a Ruby block rather than postflight_steps, measured on brew
-            # 6.0.22: the steps sandbox substitutes HOME with a temporary directory,
-            # so mimi install writes the plist there and launchctl refuses to
-            # bootstrap it - and the failed step rolls the whole install back.
-            # brew style flags this (Cask/InstallSteps); the offense is the price.
-            postflight do
-              system_command "#{appdir}/Mimi.app/Contents/MacOS/mimi",
-                             args: ["install"]
-            end
-
-            uninstall launchctl: "dev.pkarpovich.mimi",
-                      quit:      "dev.pkarpovich.mimi"
+            # launchd is mimi's business, not the cask's. \`mimi install\` writes the
+            # agent once; on an upgrade the running daemon notices its bundle was
+            # swapped, finishes any recording in progress and exits, and launchd -
+            # keeping the agent alive only while the bundle's own binary exists -
+            # starts the new version. An uninstall stanza unloading the agent would
+            # take it down on every upgrade, and loading it back from postflight_steps
+            # is impossible: the steps sandbox cannot talk to launchd.
 
             # Recordings are deliberately absent: zap removes what the app owns,
             # and the meetings belong to whoever recorded them.
             zap trash: [
               "~/.config/mimi",
+              "~/Library/LaunchAgents/dev.pkarpovich.mimi.plist",
               "~/Library/Logs/mimi.err.log",
               "~/Library/Logs/mimi.log",
             ]
 
             caveats <<~CAVEATS
-              mimi starts on its own: installing the cask writes the launchd
-              agent dev.pkarpovich.mimi and loads it, and an upgrade does the
-              same again. Nothing to run by hand.
+              Once, after the first install:
+
+                mimi install
+
+              That writes the launchd agent dev.pkarpovich.mimi and starts it.
+              Upgrades need nothing: the running daemon notices the new bundle,
+              finishes any recording in progress and restarts itself.
 
               The first time a meeting starts, macOS asks for the microphone.
               Granting it is what makes the recording carry your voice; without

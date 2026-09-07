@@ -23,6 +23,7 @@ src/writer.rs           ExtAudioFile ADTS AAC writer, stereo fold, resampling   
 src/remux.rs            ADTS -> m4a packet copy at completion
 src/sink.rs             Sink trait, local-folder implementation, sidecar JSON
 src/hook.rs             completion-hook thread: sidecar ledger, shell run, retry
+src/executable.rs       the running binary's identity, and the watch that retires the daemon when it is swapped
 src/service.rs          launchd agent install/uninstall
 src/instance.rs         the advisory single-instance lock
 src/macos/mod.rs        raw Core Audio property helpers                              (unsafe)
@@ -128,6 +129,12 @@ The resolved path is then walked to the root, because judging the leaf alone jud
 `service::install` writes the plist with the running executable's path **after `fs::canonicalize`**. The cask links `/opt/homebrew/bin/mimi` to the binary inside `Mimi.app`, and `mimi install` typed at a shell arrives through that link; without the resolution the plist ran the link, and macOS derives what a process is from the path it was executed by - `NSRunningApplication` for the daemon was nil, Control Center and Privacy & Security showed a generic icon beside "mimi", and the microphone grant was keyed to the link's path rather than to the bundle that the whole app-bundle design exists to make durable. Measured on 26.6.2 before the fix; the same daemon started from the bundle path is the app.
 
 `install` over a loaded agent used to race launchd: `bootout` returns before the service is gone, and a `bootstrap` issued right behind it is refused with `Bootstrap failed: 5: Input/output error`, leaving nothing loaded. `wait_unloaded` polls `launchctl print` on the service until launchd no longer knows it (capped at 5 s) before the bootstrap.
+
+## Upgrades are mimi's own business
+
+The cask never loads or unloads the agent. `mimi install` writes the plist once, with `KeepAlive` as `PathState` on the bundle's own binary rather than `true`: launchd keeps the daemon alive only while `/Applications/Mimi.app/Contents/MacOS/mimi` exists, which is what makes `brew uninstall` end in silence instead of a respawn loop over a missing file. `executable::watch` (a thread started in `main`, polling every 2 s) compares the device and inode of that path with what it found at startup; a swap or a removal - what Homebrew does on upgrade and uninstall - raises `Shutdown::retire`, and the run loop ends as soon as no session is open, so a recording in progress is finished rather than cut. launchd then starts whatever binary is at the path, which after an upgrade is the new version.
+
+Why not the cask: an `uninstall launchctl:` stanza runs on every upgrade too, which is how 0.1.1 lost its daemon on each `brew upgrade` (#6 answered that with a `postflight` calling `mimi install`, now deprecated by Homebrew 6). `postflight_steps`, the replacement, runs in a sandbox that substitutes `HOME` and refuses launchd: measured on brew 6.0.22 twice - once with the fake home, once with the real home declared writable and `HOME` restored through `env:` - `launchctl bootstrap` answers `Bootstrap failed: 5` and the failed step rolls the whole install back. No cask in Homebrew/homebrew-cask loads a launch agent from steps; the ones that ship daemons let a `.pkg` or the app itself do it.
 
 ## Code style
 

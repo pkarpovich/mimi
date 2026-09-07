@@ -39,32 +39,63 @@ pub struct Settings {
     pub grace: Duration,
 }
 
-/// Shutdown is the flag the signal handlers raise and the run loop reads between events.
+/// Shutdown is what the signal handlers and the executable watch raise; the run loop reads it
+/// between events. A signal stops at once; a retirement waits for the session in progress.
 #[derive(Debug, Clone, Default)]
-pub struct Shutdown(Arc<AtomicBool>);
+pub struct Shutdown {
+    now: Arc<AtomicBool>,
+    after_session: Arc<AtomicBool>,
+}
 
 impl Shutdown {
     pub fn new() -> Self {
-        Self(Arc::new(AtomicBool::new(false)))
+        Self::default()
     }
 
     /// install asks SIGINT and SIGTERM to raise this flag instead of ending the process.
     pub fn install(&self) -> Result<(), io::Error> {
-        let Self(raised) = self;
-        flag::register(SIGINT, Arc::clone(raised))?;
-        flag::register(SIGTERM, Arc::clone(raised))?;
+        let Self {
+            now,
+            after_session: _,
+        } = self;
+        flag::register(SIGINT, Arc::clone(now))?;
+        flag::register(SIGTERM, Arc::clone(now))?;
         Ok(())
     }
 
     pub fn requested(&self) -> bool {
-        let Self(raised) = self;
-        raised.load(Ordering::Relaxed)
+        let Self {
+            now,
+            after_session: _,
+        } = self;
+        now.load(Ordering::Relaxed)
+    }
+
+    /// retire asks the run loop to stop as soon as no session is open, so a recording in
+    /// progress is finished rather than cut.
+    pub fn retire(&self) {
+        let Self {
+            now: _,
+            after_session,
+        } = self;
+        after_session.store(true, Ordering::Relaxed);
+    }
+
+    pub fn retiring(&self) -> bool {
+        let Self {
+            now: _,
+            after_session,
+        } = self;
+        after_session.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
     pub fn request(&self) {
-        let Self(raised) = self;
-        raised.store(true, Ordering::Relaxed);
+        let Self {
+            now,
+            after_session: _,
+        } = self;
+        now.store(true, Ordering::Relaxed);
     }
 }
 
@@ -116,6 +147,10 @@ pub fn run(
     let mut recover_at = Instant::now() + RECOVERY;
 
     while !shutdown.requested() {
+        if shutdown.retiring() && session.is_none() {
+            info!("retiring with no session open");
+            break;
+        }
         let event = match events.recv_timeout(IDLE_TICK) {
             Ok(event) => event,
             Err(RecvTimeoutError::Timeout) => ActivityEvent::Tick,
@@ -961,5 +996,110 @@ mod tests {
 
         assert_eq!(capture.starts.load(Ordering::Relaxed), 0);
         assert_eq!(sink.accepted().len(), 0);
+    }
+
+    #[test]
+    fn a_retirement_with_no_session_open_ends_the_run_loop_at_once() {
+        let dir = TempDir::new();
+        let source = FakeActivity {
+            processes: vec![vec![process(InputState::Idle)]],
+            devices: vec![devices("BuiltInMicrophoneDevice")],
+            snapshots: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        };
+        let mut capture = FakeCapture::new(None);
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        shutdown.retire();
+        let (events, incoming) = mpsc::channel();
+        let (stop, stopped) = mpsc::channel();
+
+        thread::scope(|scope| {
+            scope.spawn(|| poll(&source, Duration::from_millis(5), stopped, events));
+            let runner = scope.spawn(|| {
+                run(
+                    settings(dir.path(), Duration::from_millis(150)),
+                    devices("BuiltInMicrophoneDevice"),
+                    &mut capture,
+                    &sink,
+                    incoming,
+                    &shutdown,
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !runner.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                runner.is_finished(),
+                "a retirement with nothing recording must not wait for a signal"
+            );
+            let _ = stop.send(());
+        });
+
+        assert!(sink.accepted().is_empty(), "nothing was recorded");
+        assert!(!shutdown.requested(), "no signal was involved");
+    }
+
+    #[test]
+    fn a_retirement_during_a_recording_waits_for_the_meeting_to_end() {
+        let dir = TempDir::new();
+        let mut processes = vec![vec![process(InputState::Running)]; 20];
+        processes.push(vec![process(InputState::Idle)]);
+        let source = FakeActivity {
+            processes,
+            devices: vec![devices("BuiltInMicrophoneDevice")],
+            snapshots: AtomicUsize::new(0),
+            samples: AtomicUsize::new(0),
+        };
+        let mut capture = FakeCapture::new(None);
+        let starts = capture.starts();
+        let sink = FakeSink::default();
+        let shutdown = Shutdown::new();
+        let (events, incoming) = mpsc::channel();
+        let (stop, stopped) = mpsc::channel();
+
+        thread::scope(|scope| {
+            scope.spawn(|| poll(&source, Duration::from_millis(5), stopped, events));
+            let runner = scope.spawn(|| {
+                run(
+                    settings(dir.path(), Duration::from_millis(50)),
+                    devices("BuiltInMicrophoneDevice"),
+                    &mut capture,
+                    &sink,
+                    incoming,
+                    &shutdown,
+                );
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while starts.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                starts.load(Ordering::Relaxed),
+                1,
+                "the meeting is being recorded"
+            );
+            shutdown.retire();
+            assert!(
+                !runner.is_finished(),
+                "a retirement must not cut the recording in progress"
+            );
+            while !runner.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                runner.is_finished(),
+                "the loop ends once the meeting is over"
+            );
+            let _ = stop.send(());
+        });
+
+        assert_eq!(
+            sink.accepted().len(),
+            1,
+            "the recording that was in progress reached the sink whole"
+        );
+        assert!(!shutdown.requested(), "no signal was involved");
     }
 }
