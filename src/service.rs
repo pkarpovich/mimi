@@ -2,10 +2,14 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
 const LAUNCHCTL: &str = "/bin/launchctl";
+const UNLOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const UNLOAD_POLL: Duration = Duration::from_millis(100);
 
 /// LABEL is the launchd label mimi's user agent is addressed by.
 pub const LABEL: &str = "dev.pkarpovich.mimi";
@@ -92,6 +96,7 @@ pub fn install(home: &Path, user: u32) -> Result<PathBuf, ServiceError> {
         Ok(program) => program,
         Err(source) => return Err(ServiceError::Program(source)),
     };
+    let program = resolve(&program)?;
     let layout = layout(home);
     let Layout {
         agent,
@@ -110,12 +115,20 @@ pub fn install(home: &Path, user: u32) -> Result<PathBuf, ServiceError> {
     }
 
     let _ = launchctl(&["bootout".to_owned(), service_target(user)]);
+    wait_unloaded(&service_target(user));
     launchctl(&[
         "bootstrap".to_owned(),
         domain_target(user),
         agent.display().to_string(),
     ])?;
     Ok(agent.clone())
+}
+
+fn resolve(program: &Path) -> Result<PathBuf, ServiceError> {
+    match fs::canonicalize(program) {
+        Ok(program) => Ok(program),
+        Err(source) => Err(ServiceError::Program(source)),
+    }
 }
 
 /// uninstall unloads the agent and removes its plist, leaving recordings and logs alone.
@@ -138,6 +151,16 @@ pub fn uninstall(home: &Path, user: u32) -> Result<PathBuf, ServiceError> {
         });
     }
     Ok(agent.clone())
+}
+
+fn wait_unloaded(service: &str) {
+    let deadline = Instant::now() + UNLOAD_TIMEOUT;
+    while Instant::now() < deadline {
+        if launchctl(&["print".to_owned(), service.to_owned()]).is_err() {
+            return;
+        }
+        thread::sleep(UNLOAD_POLL);
+    }
 }
 
 fn domain_target(user: u32) -> String {
@@ -328,5 +351,57 @@ mod tests {
         let agent = uninstall(&home, 0).expect("nothing to remove");
         assert!(!agent.exists());
         let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_program_is_resolved_through_symlinks_to_the_file_launchd_must_run() {
+        let dir = std::env::temp_dir().join(format!("mimi-service-resolve-{}", std::process::id()));
+        fs::create_dir_all(dir.join("Mimi.app/Contents/MacOS")).expect("create the bundle dirs");
+        let real = dir.join("Mimi.app/Contents/MacOS/mimi");
+        fs::write(&real, b"").expect("create the binary");
+        let link = dir.join("mimi");
+        std::os::unix::fs::symlink(&real, &link).expect("link to it");
+
+        let resolved = resolve(&link).expect("resolve the link");
+
+        assert_eq!(resolved, fs::canonicalize(&real).expect("the real path"));
+        assert!(
+            resolved
+                .to_string_lossy()
+                .contains("Mimi.app/Contents/MacOS/mimi"),
+            "the agent must run the binary inside the bundle, not the link on PATH"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_program_that_is_not_there_is_reported_rather_than_written() {
+        let missing =
+            std::env::temp_dir().join(format!("mimi-service-missing-{}", std::process::id()));
+        let failure = resolve(&missing).expect_err("nothing to resolve");
+        match failure {
+            ServiceError::Program(_) => {}
+            ServiceError::Directory { path: _, source: _ }
+            | ServiceError::Write { path: _, source: _ }
+            | ServiceError::Remove { path: _, source: _ }
+            | ServiceError::Unavailable {
+                arguments: _,
+                source: _,
+            }
+            | ServiceError::Refused {
+                arguments: _,
+                reason: _,
+            } => panic!("{failure}"),
+        }
+    }
+
+    #[test]
+    fn waiting_for_a_service_that_is_not_loaded_returns_at_once() {
+        let started = Instant::now();
+        wait_unloaded("gui/501/dev.pkarpovich.mimi.never-loaded");
+        assert!(
+            started.elapsed() < UNLOAD_TIMEOUT,
+            "a service launchd does not know is already unloaded"
+        );
     }
 }
