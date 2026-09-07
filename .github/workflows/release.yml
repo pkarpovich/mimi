@@ -101,6 +101,45 @@ jobs:
             exit 1
           fi
 
+      # Developer ID alone leaves the bundle "rejected" by Gatekeeper: a signed
+      # but unnotarized app cannot be opened from Finder, and only launchd's
+      # direct exec of the binary kept the daemon running. notarytool needs the
+      # hardened runtime bundle.sh already applies; the ticket is stapled so the
+      # verdict holds offline too.
+      - name: Notarize and staple
+        env:
+          KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+          ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KEY_P8: ${{ secrets.APP_STORE_CONNECT_KEY_P8 }}
+        run: |
+          key=$(mktemp)
+          printf '%s\n' "$KEY_P8" > "$key"
+          ditto -c -k --keepParent dist/Mimi.app dist/notarize.zip
+          submission=$(xcrun notarytool submit dist/notarize.zip \
+            --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" \
+            --wait --timeout 30m --output-format json)
+          echo "$submission"
+          id=$(echo "$submission" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+          status=$(echo "$submission" | python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])')
+          if [ "$status" != "Accepted" ]; then
+            xcrun notarytool log "$id" --key "$key" --key-id "$KEY_ID" --issuer "$ISSUER_ID" >&2
+            rm -f "$key"
+            exit 1
+          fi
+          rm -f "$key" dist/notarize.zip
+          xcrun stapler staple dist/Mimi.app
+
+      # The release is what the cask downloads, so the verdict is taken here on
+      # the exact bundle that is about to be zipped, not on a rebuilt one.
+      - name: Gatekeeper accepts the bundle
+        run: |
+          verdict=$(spctl --assess --type exec --verbose=2 dist/Mimi.app 2>&1)
+          echo "$verdict"
+          if ! echo "$verdict" | grep -q "Notarized Developer ID"; then
+            echo "the bundle is not notarized" >&2
+            exit 1
+          fi
+
       - name: Package
         run: |
           version="${GITHUB_REF_NAME#v}"
@@ -168,11 +207,16 @@ jobs:
 
             url "https://github.com/pkarpovich/mimi/releases/download/v#{version}/Mimi-arm64-#{version}.zip"
             name "mimi"
-            desc "macOS meeting recorder daemon"
+            desc "Meeting recorder daemon"
             homepage "https://github.com/pkarpovich/mimi"
 
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
             depends_on arch: :arm64
-            depends_on macos: ">= :sonoma"
+            depends_on macos: :sonoma
 
             # The app is what makes the microphone grant durable. TCC identifies a
             # bundle by its identifier at a path that never moves, and a loose binary
@@ -186,21 +230,31 @@ jobs:
             # uninstall stanza below unloads the agent and removes its plist. Without
             # this the daemon is simply gone after every upgrade, silently. postflight
             # runs on install and on upgrade alike, and mimi install is idempotent.
+            # It stays a Ruby block rather than postflight_steps, measured on brew
+            # 6.0.22: the steps sandbox substitutes HOME with a temporary directory,
+            # so mimi install writes the plist there and launchctl refuses to
+            # bootstrap it - and the failed step rolls the whole install back.
+            # brew style flags this (Cask/InstallSteps); the offense is the price.
             postflight do
               system_command "#{appdir}/Mimi.app/Contents/MacOS/mimi",
                              args: ["install"]
             end
 
+            uninstall launchctl: "dev.pkarpovich.mimi",
+                      quit:      "dev.pkarpovich.mimi"
+
+            # Recordings are deliberately absent: zap removes what the app owns,
+            # and the meetings belong to whoever recorded them.
+            zap trash: [
+              "~/.config/mimi",
+              "~/Library/Logs/mimi.err.log",
+              "~/Library/Logs/mimi.log",
+            ]
+
             caveats <<~CAVEATS
               mimi starts on its own: installing the cask writes the launchd
               agent dev.pkarpovich.mimi and loads it, and an upgrade does the
               same again. Nothing to run by hand.
-
-              It records with its defaults. To change where recordings land or
-              which applications trigger one, write ~/.config/mimi/config.toml -
-              see the README for the keys - and check it with:
-
-                mimi --check-config
 
               The first time a meeting starts, macOS asks for the microphone.
               Granting it is what makes the recording carry your voice; without
@@ -208,20 +262,9 @@ jobs:
               The grant survives upgrades: the app is identified by its bundle
               id at a path that does not move.
 
-              Recordings land in ~/Recordings/mimi and are never deleted by
-              mimi. Logs are at ~/Library/Logs/mimi.log and mimi.err.log.
+              Configuration, recordings and logs are described in the README:
+              https://github.com/pkarpovich/mimi#readme
             CAVEATS
-
-            uninstall quit:      "dev.pkarpovich.mimi",
-                      launchctl: "dev.pkarpovich.mimi"
-
-            # Recordings are deliberately absent: zap removes what the app owns,
-            # and the meetings belong to whoever recorded them.
-            zap trash: [
-              "~/.config/mimi",
-              "~/Library/Logs/mimi.log",
-              "~/Library/Logs/mimi.err.log",
-            ]
           end
           EOF
 
