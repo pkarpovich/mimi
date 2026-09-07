@@ -123,6 +123,12 @@ The resolved path is then walked to the root, because judging the leaf alone jud
 
 **Shutdown drops the queue, not the work.** `ShellRunner` watches the same `Shutdown` flag inside its poll loop, so the join in `main` is bounded by one 200 ms tick rather than by `on_complete_timeout_seconds`. Nothing is flushed on the way out: every job that was not marked done is still `pending` on disk, and the next start's scan finds it.
 
+## The agent runs the executable inside the bundle
+
+`service::install` writes the plist with the running executable's path **after `fs::canonicalize`**. The cask links `/opt/homebrew/bin/mimi` to the binary inside `Mimi.app`, and `mimi install` typed at a shell arrives through that link; without the resolution the plist ran the link, and macOS derives what a process is from the path it was executed by - `NSRunningApplication` for the daemon was nil, Control Center and Privacy & Security showed a generic icon beside "mimi", and the microphone grant was keyed to the link's path rather than to the bundle that the whole app-bundle design exists to make durable. Measured on 26.6.2 before the fix; the same daemon started from the bundle path is the app.
+
+`install` over a loaded agent used to race launchd: `bootout` returns before the service is gone, and a `bootstrap` issued right behind it is refused with `Bootstrap failed: 5: Input/output error`, leaving nothing loaded. `wait_unloaded` polls `launchctl print` on the service until launchd no longer knows it (capped at 5 s) before the bootstrap.
+
 ## Code style
 
 - No comments. A comment is justified only when the *why* cannot be recovered from the code - a

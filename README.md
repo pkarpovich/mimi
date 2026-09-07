@@ -143,13 +143,13 @@ For distribution there is `scripts/bundle.sh <binary> <out-dir> [identity]`, whi
 
 The bundle-only keys (`CFBundleExecutable`, `CFBundlePackageType`, `LSUIElement`, `CFBundleIconFile`) are deliberately absent from `Info.plist.template` and added by `bundle.sh`, because `build.rs` embeds that template into the bare binary and declaring a loose daemon an `APPL` bundle makes macOS treat it as a UI application.
 
-Then install the LaunchAgent, which points at the executable you run `install` from:
+Then install the LaunchAgent, which points at the executable you run `install` from, symlinks resolved - `mimi install` through the `mimi` on PATH still records `/Applications/Mimi.app/Contents/MacOS/mimi`:
 
 ```sh
 ./target/release/mimi install
 ```
 
-That writes `~/Library/LaunchAgents/dev.pkarpovich.mimi.plist` with `RunAtLoad` and `KeepAlive`, and loads it with `launchctl bootstrap gui/<uid>`. Re-installing over a loaded agent replaces it.
+That writes `~/Library/LaunchAgents/dev.pkarpovich.mimi.plist` with `RunAtLoad` and `KeepAlive`, and loads it with `launchctl bootstrap gui/<uid>`. Re-installing over a loaded agent replaces it: the old one is booted out, `install` waits for launchd to let go of it, then bootstraps the new one. The resolved path matters beyond tidiness: macOS derives what a process *is* from the path it was executed by, so a daemon started through the symlink is a bare binary to the system - a generic icon next to "mimi" in Control Center and in Privacy & Security, and a microphone grant tied to that path rather than to the bundle. Started from inside `Mimi.app` it is the app.
 
 Installed from the cask, this runs by itself: the cask's `postflight` calls `mimi install` after every install and every upgrade. That is not decoration - Homebrew upgrades a cask by uninstalling the old version first, and the uninstall stanza unloads the agent and deletes its plist, so without the postflight the daemon would be gone after each upgrade and nothing would say so.
 
