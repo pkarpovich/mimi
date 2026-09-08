@@ -1,9 +1,9 @@
 use std::time::Duration;
 
-/// OPENING_WINDOW is how much of a capture's opening is examined before a verdict is reached.
-pub const OPENING_WINDOW: Duration = Duration::from_secs(3);
+/// SILENCE_WINDOW is how much of a capture has to be seen before all-zero samples count as silence.
+pub const SILENCE_WINDOW: Duration = Duration::from_secs(3);
 
-/// Verdict is what the detector can say about the window it has been fed so far.
+/// Verdict is what the detector can say about the capture it has been fed so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
     Undecided,
@@ -11,7 +11,7 @@ pub enum Verdict {
     AudioPresent,
 }
 
-/// Silence watches the opening window of a capture for the all-zero samples a dead tap delivers.
+/// Silence watches a whole capture for the all-zero samples a dead tap delivers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Silence {
     window: Duration,
@@ -34,7 +34,7 @@ impl Silence {
         }
     }
 
-    /// feed adds one block of samples and the span of time they cover to the window.
+    /// feed adds one block of samples and the span of time they cover to what was examined.
     pub fn feed(&mut self, samples: &[f32], duration: Duration) {
         let Self {
             window,
@@ -44,9 +44,6 @@ impl Silence {
         match heard {
             Heard::Audio => return,
             Heard::Nothing => {}
-        }
-        if elapsed >= window {
-            return;
         }
         for sample in samples {
             if *sample != 0.0 {
@@ -75,19 +72,19 @@ impl Silence {
         }
     }
 
-    /// reset restarts the window so the opening of a rebuilt capture is examined again.
+    /// reset restarts the judgement so a rebuilt capture is examined on its own.
     pub fn reset(&mut self) {
         *self = Self::new(self.window);
     }
 }
 
-/// settled folds a closed window's verdict into the one a session reports; silence is sticky.
-pub fn settled(session: Verdict, window: Verdict) -> Verdict {
-    match (session, window) {
+/// settled folds a capture's verdict into the one a session reports; audio anywhere is audio.
+pub fn settled(session: Verdict, capture: Verdict) -> Verdict {
+    match (session, capture) {
         (Verdict::Silent, Verdict::Silent) => Verdict::Silent,
-        (Verdict::Silent, Verdict::AudioPresent) => Verdict::Silent,
+        (Verdict::Silent, Verdict::AudioPresent) => Verdict::AudioPresent,
         (Verdict::Silent, Verdict::Undecided) => Verdict::Silent,
-        (Verdict::AudioPresent, Verdict::Silent) => Verdict::Silent,
+        (Verdict::AudioPresent, Verdict::Silent) => Verdict::AudioPresent,
         (Verdict::AudioPresent, Verdict::AudioPresent) => Verdict::AudioPresent,
         (Verdict::AudioPresent, Verdict::Undecided) => Verdict::AudioPresent,
         (Verdict::Undecided, Verdict::Silent) => Verdict::Silent,
@@ -133,16 +130,20 @@ mod tests {
     }
 
     #[test]
-    fn samples_arriving_after_the_window_closed_do_not_change_the_verdict() {
+    fn audio_arriving_after_the_window_closed_still_flips_the_verdict() {
         let mut silence = Silence::new(WINDOW);
         silence.feed(&[0.0; 64], WINDOW);
         assert_eq!(silence.verdict(), Verdict::Silent);
         silence.feed(&[0.5; 64], HALF);
-        assert_eq!(silence.verdict(), Verdict::Silent);
+        assert_eq!(
+            silence.verdict(),
+            Verdict::AudioPresent,
+            "a capture whose devices took seconds to deliver is not a silent one"
+        );
     }
 
     #[test]
-    fn reset_restarts_the_window() {
+    fn reset_restarts_the_judgement() {
         let mut silence = Silence::new(WINDOW);
         silence.feed(&[0.5; 64], WINDOW);
         assert_eq!(silence.verdict(), Verdict::AudioPresent);
@@ -163,15 +164,16 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_fired_is_what_the_session_keeps_reporting() {
+    fn audio_in_any_capture_is_what_the_session_reports() {
         assert_eq!(
             settled(Verdict::Silent, Verdict::AudioPresent),
-            Verdict::Silent,
-            "a window that opened on silence is not unsaid by a later one that heard audio"
+            Verdict::AudioPresent,
+            "a capture that heard audio is not unsaid by a dead one before it"
         );
         assert_eq!(
             settled(Verdict::AudioPresent, Verdict::Silent),
-            Verdict::Silent
+            Verdict::AudioPresent,
+            "a rebuild that came back dead does not erase the audio already recorded"
         );
         assert_eq!(
             settled(Verdict::Silent, Verdict::Undecided),
@@ -180,7 +182,12 @@ mod tests {
         assert_eq!(
             settled(Verdict::AudioPresent, Verdict::Undecided),
             Verdict::AudioPresent,
-            "a rebuild too late to fill its window does not erase what was already judged"
+            "a rebuild too short to judge does not erase what was already judged"
+        );
+        assert_eq!(
+            settled(Verdict::Silent, Verdict::Silent),
+            Verdict::Silent,
+            "a session that never heard anything is the one silence is for"
         );
     }
 
@@ -201,9 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn the_opening_window_is_bounded() {
-        let silence = Silence::new(OPENING_WINDOW);
+    fn the_silence_window_is_bounded() {
+        let silence = Silence::new(SILENCE_WINDOW);
         assert_eq!(silence.verdict(), Verdict::Undecided);
-        assert_eq!(OPENING_WINDOW, Duration::from_secs(3));
+        assert_eq!(SILENCE_WINDOW, Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_capture_that_only_starts_delivering_after_the_window_is_not_silent() {
+        let mut silence = Silence::new(SILENCE_WINDOW);
+        for _ in 0..8 {
+            silence.feed(&[0.0; 1024], Duration::from_millis(500));
+        }
+        assert_eq!(silence.verdict(), Verdict::Silent);
+
+        silence.feed(&[0.0, 0.0, 0.25], Duration::from_millis(500));
+        assert_eq!(
+            silence.verdict(),
+            Verdict::AudioPresent,
+            "a meeting joined after the recording started is audio, not digital silence"
+        );
     }
 }
