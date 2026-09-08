@@ -297,9 +297,9 @@ fn finish_session(
         None => Written::Whole,
     };
     match verdict {
-        Verdict::AudioPresent => info!("{} opened with audio present", partial.display()),
+        Verdict::AudioPresent => info!("{} carries audio", partial.display()),
         Verdict::Undecided => info!("{} was too short to judge for silence", partial.display()),
-        Verdict::Silent => warn!("{} opened on digital silence", partial.display()),
+        Verdict::Silent => warn!("{} is digital silence", partial.display()),
     }
 
     let recording = Recording {

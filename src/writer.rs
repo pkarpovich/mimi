@@ -22,7 +22,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::capture::{
-    Block, Consumer, Drained, Formats, OPENING_WINDOW, Silence, Verdict, settled,
+    Block, Consumer, Drained, Formats, SILENCE_WINDOW, Silence, Verdict, settled,
 };
 
 /// CHANNELS is how many channels a recording carries: the microphone left, everyone else right.
@@ -170,7 +170,7 @@ fn run(
         }
     };
 
-    let mut silence = Silence::new(OPENING_WINDOW);
+    let mut silence = Silence::new(SILENCE_WINDOW);
     let mut session = Verdict::Undecided;
     let mut encoding = Encoding::new(consumer.frames_per_block());
     loop {
@@ -866,7 +866,51 @@ mod tests {
     }
 
     #[test]
-    fn a_window_that_fired_before_a_rebuild_is_still_what_the_session_reports() {
+    fn a_capture_that_starts_delivering_late_is_not_reported_as_silence() {
+        let file = TempFile::new();
+        let formats = Formats::new();
+        formats.publish(1, 24_000.0);
+
+        let (producer, consumer) = ring(64, 4096);
+        let zeros = vec![0.0; 4096];
+        for round in 0..18 {
+            producer.push(BlockRef {
+                microphone: &zeros,
+                system: &zeros,
+                frames: 4096,
+                host_time: round,
+                generation: 1,
+            });
+        }
+        let audible = vec![0.25; 4096];
+        producer.push(BlockRef {
+            microphone: &audible,
+            system: &audible,
+            frames: 4096,
+            host_time: 18,
+            generation: 1,
+        });
+
+        let writer = spawn(
+            WriterSettings {
+                path: file.path().to_path_buf(),
+                sample_rate: 24_000,
+                bit_rate: 96_000,
+            },
+            consumer,
+            formats,
+        );
+        let Finished { error, verdict } = writer.finish();
+        assert_eq!(error, None);
+        assert_eq!(
+            verdict,
+            Verdict::AudioPresent,
+            "devices that took seconds to deliver leave a recording with audio in it, not a silent one"
+        );
+    }
+
+    #[test]
+    fn a_rebuild_that_heard_audio_lifts_a_capture_that_was_dead() {
         let file = TempFile::new();
         let formats = Formats::new();
         formats.publish(1, 24_000.0);
@@ -905,13 +949,13 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(
             verdict,
-            Verdict::Silent,
-            "an opening judged silent is what the sidecar reports, whatever a rebuild heard after it"
+            Verdict::AudioPresent,
+            "a rebuild that came back audible is what the sidecar reports, whatever was dead before it"
         );
     }
 
     #[test]
-    fn a_rebuild_that_turned_silent_is_judged_on_its_own_window() {
+    fn a_rebuild_that_came_back_dead_does_not_erase_the_audio_before_it() {
         let file = TempFile::new();
         let formats = Formats::new();
         formats.publish(1, 24_000.0);
@@ -950,8 +994,8 @@ mod tests {
         assert_eq!(error, None);
         assert_eq!(
             verdict,
-            Verdict::Silent,
-            "the window a rebuild opened must judge the new capture, not the audible one before it"
+            Verdict::AudioPresent,
+            "a recording that holds audible minutes is not skipped because its capture died later"
         );
     }
 
