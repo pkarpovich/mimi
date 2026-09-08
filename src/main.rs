@@ -6,6 +6,7 @@ mod plist;
 mod activity;
 mod capture;
 mod config;
+mod executable;
 mod hook;
 mod instance;
 mod macos;
@@ -28,6 +29,7 @@ use crate::activity::Devices;
 use crate::activity::poller::{self, CoreAudio};
 use crate::capture::{CaptureConfig, Tap};
 use crate::config::Config;
+use crate::executable::Executable;
 use crate::hook::HookSettings;
 use crate::session::{Settings, Shutdown};
 use crate::sink::LocalFolder;
@@ -36,6 +38,7 @@ const AGGREGATE_NAME: &str = "mimi";
 const AGGREGATE_UID: &str = "dev.pkarpovich.mimi.aggregate";
 const HOOK_RETRY_BASE: Duration = Duration::from_secs(60);
 const HOOK_RETRY_CAP: Duration = Duration::from_secs(1800);
+const EXECUTABLE_POLL: Duration = Duration::from_secs(2);
 
 /// mimi records meetings while a meeting application holds the microphone.
 #[derive(FromArgs)]
@@ -178,6 +181,27 @@ fn run() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    let program = match service::executable() {
+        Ok(program) => program,
+        Err(error) => {
+            eprintln!("mimi: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(identity) = executable::identity(&program) else {
+        eprintln!("mimi: {} could not be looked at", program.display());
+        return ExitCode::FAILURE;
+    };
+    let (unwatch, unwatched) = mpsc::channel();
+    thread::spawn({
+        let shutdown = shutdown.clone();
+        let watched = Executable {
+            path: program,
+            identity,
+        };
+        move || executable::watch(watched, EXECUTABLE_POLL, shutdown, unwatched)
+    });
+
     let (hook, sink, output_dir) = match on_complete {
         None => (None, LocalFolder::new(None), output_dir),
         Some(command) => {
@@ -236,6 +260,7 @@ fn run() -> ExitCode {
     if let Some(hook) = hook {
         hook.join();
     }
+    drop(unwatch);
     drop(stop);
     ExitCode::SUCCESS
 }

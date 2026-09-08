@@ -75,7 +75,13 @@ pub fn render(program: &Path, layout: &Layout) -> String {
 	<key>RunAtLoad</key>
 	<true/>
 	<key>KeepAlive</key>
-	<true/>
+	<dict>
+		<key>PathState</key>
+		<dict>
+			<key>{program}</key>
+			<true/>
+		</dict>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>{out}</string>
 	<key>StandardErrorPath</key>
@@ -92,11 +98,7 @@ pub fn render(program: &Path, layout: &Layout) -> String {
 
 /// install writes the agent for the running executable and asks launchd to load it.
 pub fn install(home: &Path, user: u32) -> Result<PathBuf, ServiceError> {
-    let program = match std::env::current_exe() {
-        Ok(program) => program,
-        Err(source) => return Err(ServiceError::Program(source)),
-    };
-    let program = resolve(&program)?;
+    let program = executable()?;
     let layout = layout(home);
     let Layout {
         agent,
@@ -122,6 +124,15 @@ pub fn install(home: &Path, user: u32) -> Result<PathBuf, ServiceError> {
         agent.display().to_string(),
     ])?;
     Ok(agent.clone())
+}
+
+/// executable is the resolved path of the running binary, the one launchd is told to run.
+pub fn executable() -> Result<PathBuf, ServiceError> {
+    let program = match std::env::current_exe() {
+        Ok(program) => program,
+        Err(source) => return Err(ServiceError::Program(source)),
+    };
+    resolve(&program)
 }
 
 fn resolve(program: &Path) -> Result<PathBuf, ServiceError> {
@@ -285,15 +296,17 @@ mod tests {
     }
 
     #[test]
-    fn the_agent_runs_at_load_keeps_alive_and_asks_for_the_run_subcommand() {
+    fn the_agent_runs_at_load_stays_alive_while_its_binary_exists_and_asks_for_run() {
         let rendered = render(Path::new("/usr/local/bin/mimi"), &layout(&home()));
         assert!(
             rendered.contains("<key>RunAtLoad</key>\n\t<true/>"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("<key>KeepAlive</key>\n\t<true/>"),
-            "{rendered}"
+            rendered.contains(
+                "<key>KeepAlive</key>\n\t<dict>\n\t\t<key>PathState</key>\n\t\t<dict>\n\t\t\t<key>/usr/local/bin/mimi</key>\n\t\t\t<true/>"
+            ),
+            "launchd must keep the agent only while the bundle's binary exists: {rendered}"
         );
         assert!(rendered.contains("<string>run</string>"), "{rendered}");
     }
